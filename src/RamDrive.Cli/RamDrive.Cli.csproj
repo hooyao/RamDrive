@@ -17,7 +17,7 @@
 
     <!-- Release-only AOT flags: wide SIMD + smaller binary -->
     <PropertyGroup Condition="'$(Configuration)' == 'Release'">
-        <IlcInstructionSet>avx2,bmi2,fma,pclmul,popcnt,aes</IlcInstructionSet>
+        <IlcInstructionSet>x86-64-v3,aes</IlcInstructionSet>
         <StackTraceSupport>false</StackTraceSupport>
     </PropertyGroup>
 
