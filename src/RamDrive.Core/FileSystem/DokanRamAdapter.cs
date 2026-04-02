@@ -277,6 +277,8 @@ public sealed class DokanRamAdapter : IDokanOperations2
         fileSystemName.SetString("NTFS");
         maximumComponentLength = 255;
         features = FileSystemFeatures.CasePreservedNames
+                 | FileSystemFeatures.PersistentAcls
+                 | FileSystemFeatures.SupportsRemoteStorage
                  | FileSystemFeatures.UnicodeOnDisk;
         return DokanResult.Success;
     }
@@ -395,14 +397,14 @@ public sealed class DokanRamAdapter : IDokanOperations2
         ReadOnlyNativeMemory<char> fileName, out FileSystemSecurity? security,
         AccessControlSections sections, ref DokanFileInfo info)
     {
-        security = null;
-        return DokanResult.NotImplemented;
+        security = info.IsDirectory ? new DirectorySecurity() : new FileSecurity();
+        return DokanResult.Success;
     }
 
     public NtStatus SetFileSecurity(
         ReadOnlyNativeMemory<char> fileName, FileSystemSecurity security,
         AccessControlSections sections, ref DokanFileInfo info)
-        => DokanResult.NotImplemented;
+        => DokanResult.Success;
 
     public NtStatus FindStreams(
         ReadOnlyNativeMemory<char> fileName, out IEnumerable<FindFileInformation> streams,

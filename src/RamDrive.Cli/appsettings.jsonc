@@ -19,7 +19,7 @@
 
     // Pre-allocate all pages at startup (true) or allocate on demand (false).
     // Pre-allocation avoids allocation latency during I/O but consumes memory immediately.
-    "PreAllocate": true,
+    "PreAllocate": false,
 
     // Volume label shown in Windows Explorer.
     "VolumeLabel": "RamDrive"
