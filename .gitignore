@@ -181,4 +181,6 @@ FodyWeavers.xsd
 # RamDrive project-specific
 appsettings.dev.jsonc
 publish-aot/
+publish-test/
+dokan-dotnet/
 .claude/
