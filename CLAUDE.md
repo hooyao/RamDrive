@@ -91,7 +91,7 @@ The project uses Native AOT compilation. Key settings in `RamDrive.Cli.csproj`:
 - `IlcFoldIdenticalMethodBodies=true` — reduce binary size
 - `ServerGarbageCollection=true` + `RetainVMGarbageCollection=true` — GC tuned for throughput
 
-Release-only flags (in `release.yml`, not local builds):
+Release-only flags (in `RamDrive.Cli.csproj` under `Release` condition):
 - `IlcInstructionSet=avx2,bmi2,fma,pclmul,popcnt,aes` — wide SIMD for memcpy/memset
 - `StackTraceSupport=false` — smaller binary, no debug stack traces
 

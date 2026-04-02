@@ -15,6 +15,12 @@
         <IlcFoldIdenticalMethodBodies>true</IlcFoldIdenticalMethodBodies>
     </PropertyGroup>
 
+    <!-- Release-only AOT flags: wide SIMD + smaller binary -->
+    <PropertyGroup Condition="'$(Configuration)' == 'Release'">
+        <IlcInstructionSet>avx2,bmi2,fma,pclmul,popcnt,aes</IlcInstructionSet>
+        <StackTraceSupport>false</StackTraceSupport>
+    </PropertyGroup>
+
     <ItemGroup>
         <PackageReference Include="Microsoft.Extensions.Hosting"/>
     </ItemGroup>
