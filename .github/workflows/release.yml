@@ -68,6 +68,7 @@ jobs:
           -c Release -r win-x64
           -p:Version=${{ steps.version.outputs.VERSION }}
           -p:IlcInstructionSet=avx2,bmi2,fma,pclmul,popcnt,aes
+          -p:StackTraceSupport=false
           -o ./publish-aot
 
       - name: Package release archive
