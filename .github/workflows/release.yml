@@ -1,0 +1,89 @@
+name: Release
+
+on:
+  push:
+    tags: ['release-*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to release (e.g. release-1.0.0)'
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Parse version from tag
+        id: version
+        shell: pwsh
+        run: |
+          $tag = if ("${{ github.event_name }}" -eq "workflow_dispatch") { "${{ inputs.tag }}" } else { "${{ github.ref_name }}" }
+          $version = $tag -replace '^release-', ''
+          Write-Output "VERSION=$version" >> $env:GITHUB_OUTPUT
+          if ($version -match '-') {
+            Write-Output "PRERELEASE=true" >> $env:GITHUB_OUTPUT
+          } else {
+            Write-Output "PRERELEASE=false" >> $env:GITHUB_OUTPUT
+          }
+          Write-Host "Version: $version, Prerelease: $($version -match '-')"
+
+      - name: Setup .NET 10
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "10.0.x"
+
+      - name: Restore dependencies
+        run: dotnet restore RamDrive.slnx
+
+      - name: Build
+        run: dotnet build RamDrive.slnx -c Release --no-restore
+
+      - name: Test
+        shell: pwsh
+        run: |
+          $projects = @(
+            "tests/RamDrive.Core.Tests/RamDrive.Core.Tests.csproj"
+          )
+          $failed = $false
+          foreach ($proj in $projects) {
+            dotnet test $proj -c Release --no-build --verbosity normal
+            if ($LASTEXITCODE -ne 0) { $failed = $true }
+          }
+          if ($failed) { exit 1 }
+
+      - name: Publish AOT executable
+        run: >
+          dotnet publish src/RamDrive.Cli/RamDrive.Cli.csproj
+          -c Release -r win-x64
+          -p:Version=${{ steps.version.outputs.VERSION }}
+          -o ./publish-aot
+
+      - name: Package release archive
+        shell: pwsh
+        run: |
+          $version = "${{ steps.version.outputs.VERSION }}"
+          Compress-Archive -Path publish-aot/RamDrive.exe, publish-aot/appsettings.jsonc -DestinationPath "RamDrive-$version.zip"
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: pwsh
+        run: |
+          $version = "${{ steps.version.outputs.VERSION }}"
+          $prerelease = "${{ steps.version.outputs.PRERELEASE }}"
+          $ghArgs = @(
+            "release", "create", "v$version",
+            "--title", "RamDrive $version",
+            "--generate-notes",
+            "RamDrive-$version.zip"
+          )
+          if ($prerelease -eq "true") {
+            $ghArgs += "--prerelease"
+          }
+          gh @ghArgs

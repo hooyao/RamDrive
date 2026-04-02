@@ -1,0 +1,84 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+  checks: write
+  pull-requests: write
+
+jobs:
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      code: ${{ steps.filter.outputs.code }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            code:
+              - 'src/**'
+              - 'tests/**'
+              - '*.slnx'
+              - '*.props'
+              - '*.targets'
+              - 'global.json'
+              - 'Directory.Build.props'
+              - 'Directory.Packages.props'
+              - '.github/workflows/ci.yml'
+
+  build-and-test:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup .NET 10
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "10.0.x"
+
+      - name: Restore dependencies
+        run: dotnet restore RamDrive.slnx
+
+      - name: Build
+        run: dotnet build RamDrive.slnx -c Release --no-restore
+
+      - name: Test
+        shell: pwsh
+        run: |
+          $projects = @(
+            "tests/RamDrive.Core.Tests/RamDrive.Core.Tests.csproj"
+          )
+          $failed = $false
+          foreach ($proj in $projects) {
+            $name = [System.IO.Path]::GetFileNameWithoutExtension($proj)
+            dotnet test $proj -c Release --no-build --verbosity normal `
+              --logger "trx;LogFileName=$name.trx" `
+              --results-directory ./TestResults `
+              --collect:"XPlat Code Coverage"
+            if ($LASTEXITCODE -ne 0) { $failed = $true }
+          }
+          if ($failed) { exit 1 }
+
+      - name: Test report
+        uses: dorny/test-reporter@v2
+        if: always()
+        with:
+          name: Test Results
+          path: TestResults/*.trx
+          reporter: dotnet-trx
+          fail-on-error: true
+          use-actions-summary: 'true'
+          only-summary: 'false'
+          list-suites: all
+          list-tests: failed

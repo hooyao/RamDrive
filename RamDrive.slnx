@@ -1,0 +1,9 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/RamDrive.Core/RamDrive.Core.csproj" />
+    <Project Path="src/RamDrive.Cli/RamDrive.Cli.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/RamDrive.Core.Tests/RamDrive.Core.Tests.csproj" />
+  </Folder>
+</Solution>

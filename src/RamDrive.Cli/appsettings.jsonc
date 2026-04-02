@@ -1,0 +1,27 @@
+{
+  "Logging": {
+    "LogLevel": {
+      "Default": "Information",
+      "Microsoft": "Warning"
+    }
+  },
+
+  "RamDrive": {
+    // Windows drive letter for the RAM disk (e.g., "R:\\").
+    "MountPoint": "R:\\",
+
+    // Total RAM disk capacity in MB.
+    "CapacityMb": 2048,
+
+    // Page size in KB. Larger pages = better throughput for big files, more waste for small files.
+    // 64 KB is a good default balancing both.
+    "PageSizeKb": 64,
+
+    // Pre-allocate all pages at startup (true) or allocate on demand (false).
+    // Pre-allocation avoids allocation latency during I/O but consumes memory immediately.
+    "PreAllocate": true,
+
+    // Volume label shown in Windows Explorer.
+    "VolumeLabel": "RamDrive"
+  }
+}
