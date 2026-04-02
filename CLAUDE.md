@@ -91,8 +91,8 @@ The project uses Native AOT compilation. Key settings in `RamDrive.Cli.csproj`:
 - `IlcFoldIdenticalMethodBodies=true` — reduce binary size
 - `ServerGarbageCollection=true` + `RetainVMGarbageCollection=true` — GC tuned for throughput
 
-Release-only flags (in `release.yml`, not local builds):
-- `IlcInstructionSet=avx2,bmi2,fma,pclmul,popcnt,aes` — wide SIMD for memcpy/memset
+Release-only flags (in `RamDrive.Cli.csproj` under `Release` condition):
+- `IlcInstructionSet=x86-64-v3,aes` — x86-64-v3 profile (avx2+bmi1+bmi2+fma+lzcnt+movbe) plus AES-NI
 - `StackTraceSupport=false` — smaller binary, no debug stack traces
 
 **Serilog was intentionally removed** in favor of `Microsoft.Extensions.Logging` + `SimpleConsole` to maintain AOT compatibility. Do not re-add Serilog.

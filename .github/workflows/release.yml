@@ -63,13 +63,12 @@ jobs:
           if ($failed) { exit 1 }
 
       - name: Publish AOT executable
-        run: >
-          dotnet publish src/RamDrive.Cli/RamDrive.Cli.csproj
-          -c Release -r win-x64
-          -p:Version=${{ steps.version.outputs.VERSION }}
-          -p:IlcInstructionSet=avx2,bmi2,fma,pclmul,popcnt,aes
-          -p:StackTraceSupport=false
-          -o ./publish-aot
+        shell: pwsh
+        run: |
+          dotnet publish src/RamDrive.Cli/RamDrive.Cli.csproj `
+            -c Release -r win-x64 `
+            "-p:Version=${{ steps.version.outputs.VERSION }}" `
+            -o ./publish-aot
 
       - name: Package release archive
         shell: pwsh
