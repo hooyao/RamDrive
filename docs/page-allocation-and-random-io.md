@@ -234,16 +234,14 @@ Writing "Hello" at offset 70,000 in a new file:
 2.   node.Content.Write(70000, "Hello")
      │
 3.   Phase 1 (read lock):
-     │  pageIndex 0 (offset 0-65535)    → need? yes (Zero)
      │  pageIndex 1 (offset 65536-...)  → need? yes (Zero)
-     │  neededCount = 2
+     │  neededCount = 1
      │
 4.   Phase 2 (no lock):
-     │  pool.RentBatch([p0, p1], 2)
-     │  ← allocates 2 × 64KB from native memory
+     │  pool.RentBatch([p1], 1)
+     │  ← allocates 1 × 64KB from native memory
      │
 5.   Phase 3 (write lock):
-     │  _pages[0] = p0    (but we don't write to page 0)
      │  _pages[1] = p1
      │
      │  Chunk 1: pageIndex=1, pageOffset=4464, chunkSize=5
@@ -251,10 +249,10 @@ Writing "Hello" at offset 70,000 in a new file:
      │
      │  _length = 70005
      │
-6. Done — 2 pages allocated, 5 bytes written across page boundary
+6. Done — 1 page allocated, 5 bytes written
 ```
 
-Note: Page 0 is allocated even though no data is written to it. This is because the write spans from page 0's range to page 1. The page table index calculation `(offset / pageSize)` to `((offset + length - 1) / pageSize)` determines which pages are touched. In this case `70000 / 65536 = 1` and `70004 / 65536 = 1`, so actually only page 1 is allocated. Page 0 remains sparse (Zero).
+The page table index calculation `firstPage = offset / pageSize` to `lastPage = (offset + length - 1) / pageSize` determines which pages are touched. Here `70000 / 65536 = 1` and `70004 / 65536 = 1`, so only page 1 is allocated. The `_pages[]` array is resized to length 2 (to hold index 0 and 1), but `_pages[0]` remains `nint.Zero` (sparse) — no memory is consumed for it.
 
 ## Performance Characteristics
 
