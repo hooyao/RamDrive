@@ -388,6 +388,47 @@ fs.VolumeParams.SetFileSystemName("HelloFs");
 | 11 | DotNext `UnmanagedMemoryPool<T>` 不是真池 | 性能比手搓版差 | 每次 `Rent()` 都 `NativeMemory.Alloc`，`Dispose()` 都 `Free`，没有复用。改回自建池 | 30 分钟 |
 | 12 | Read 在 ATTO 中远慢于 Write | Write 9 GB/s，Read 6 GB/s | WinFsp kernel Read 路径固有的 user-kernel round-trip 开销（BenchmarkDotNet 证实 Core 层 Read 比 Write 快 2 倍） | 调研 |
 | 13 | Read 远慢于 memfs（3.8 vs 9.5 GB/s） | dd benchmark 对比发现巨大差距 | memfs 设了 `FileInfoTimeout=-1` 启用 Windows 内核页缓存。cached I/O 的 Read 直接从 OS 缓存读，不回用户态 | 1 小时 |
+| 14 | kernel cache 下文件可超过磁盘容量 | 4×790MB 文件写入 2GB 盘无报错，sha256 全部正确 | `SetFileSize` 在 Write 前设 `_length`，pool 满后 Write 返回 DiskFull 但逻辑大小不回退；kernel cache 遮盖数据丢失 | 2 小时 |
+
+### 7.1 #14 深入分析：kernel cache 下 SetFileSize 与容量超卖
+
+**这是一个隐蔽且严重的数据完整性 bug。**
+
+**触发场景**：`EnableKernelCache=true`（`FileInfoTimeout=-1`）时，通过 Explorer 或 `Copy-Item` 复制大文件到 RAM disk。
+
+**调用序列**（通过 debug logging 确认）：
+
+```
+CreateFile  \target.bin  allocSize=0
+SetFileSize \target.bin  size=838860800  setAlloc=False  ← cache manager 预设文件大小
+WriteFile   \target.bin  offset=0       len=262144  cio=True
+WriteFile   \target.bin  offset=262144  len=786432  cio=True
+...（后续 WriteFile 循环回写脏页）
+```
+
+**核心问题**：Windows cache manager 在 `WriteFile` 之前调用 `SetFileSize(size=最终大小, setAllocationSize=False)`。
+旧代码 `SetLength(n)` 只设 `_length = n` 不检查容量（sparse 扩展），导致：
+
+1. `_length` 被提前设为最终值 → `FileNode.Size` 报告完整大小
+2. 后续 `WriteFile` 的 `constrainedIo=True` 依赖 `_length` 做边界判断 → 不截断
+3. 当 PagePool 容量不足时 Write 返回 `STATUS_DISK_FULL`
+4. **但 `_length` 不回退** → 文件大小仍然报告为完整值
+5. **kernel cache 已缓存了「应写入」的数据** → 后续 ReadFile 命中 cache，不回调用户态
+6. sha256 校验通过（数据来自 cache，不是 native memory）→ **用户误以为数据完整**
+
+**修复**：`SetLength` 扩展时通过 `PagePool.Reserve(count)` 预留容量。Reserve 只做 CAS 计数检查，
+不分配物理内存（写入时 `Write` 按需 Rent page 并消费 reservation）。
+容量不足时 `Reserve` 返回 false → `SetLength` 返回 false → `SetFileSize` 返回 `STATUS_DISK_FULL`
+→ cache manager 得到错误，不再继续写入 → 用户看到 "磁盘空间不足" 提示。
+
+**关键教训**：
+
+1. **kernel cache 模式下 SetFileSize 是容量承诺**——返回 SUCCESS 意味着 "这些空间已为你保留"，
+   cache manager 会基于此假设做后续 I/O。不能只设 `_length` 而不检查/保留容量。
+2. **kernel cache 会遮盖 WriteFile 错误**——即使 WriteFile 返回 DiskFull，cache 中的脏页数据
+   在被驱逐前仍可通过 ReadFile 读到。这让 sha256 校验给出虚假的正确结果。
+3. **sparse 文件语义在 kernel cache 模式下必须有容量保障**——不分配 page 没问题，
+   但必须确保未来的 Write 能拿到那些 page。Reserve 计数器是轻量级的解决方案。
 
 ---
 
@@ -502,6 +543,11 @@ var pool = new PinnedBufferPool(PinnedBufferPool.MinimalTiers);
 - **cached Read**：首次 Read 回到用户态回调取数据；后续 Read 直接从 OS 页缓存读取，不再回用户态
 - **cached Write**：写入 OS 页缓存后立即返回；cache manager 异步回写到用户态 FS
 - **Direct I/O**：绕过缓存，始终走完整 user-kernel round-trip，不受影响
+
+**重要**：kernel cache 模式下，cache manager 在写文件前会先调用 `SetFileSize` 将文件扩展到最终大小，
+然后才通过 `WriteFile` 回写脏页。`SetFileSize` 返回 SUCCESS = 容量承诺。
+如果 FS 实现未在 `SetFileSize` 时验证/预留容量，后续 WriteFile 的 DiskFull 错误会被 cache 层遮盖，
+导致静默数据丢失（详见踩坑 #14）。
 
 ### 10.3 配置
 

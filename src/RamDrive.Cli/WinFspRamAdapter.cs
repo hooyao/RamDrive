@@ -128,8 +128,8 @@ internal sealed unsafe class WinFspRamAdapter : IFileSystem
             return V(CreateResult.Error(NtStatus.ObjectPathNotFound));
         }
 
-        if (allocationSize > 0)
-            file.Content!.SetLength((long)allocationSize);
+        // allocationSize is a hint for pre-allocation, not logical file size.
+        // Do not set _length — the file starts at size 0 and grows via WriteFile.
 
         if (fileAttributes != 0)
             file.Attributes = (FileAttributes)fileAttributes;
@@ -161,8 +161,8 @@ internal sealed unsafe class WinFspRamAdapter : IFileSystem
             return V(FsResult.Error(NtStatus.ObjectNameNotFound));
 
         node.Content.SetLength(0);
-        if (allocationSize > 0)
-            node.Content.SetLength((long)allocationSize);
+        // allocationSize is a pre-reservation hint — do not set logical file size.
+        // File grows via WriteFile.
 
         if (replaceFileAttributes && fileAttributes != 0)
             node.Attributes = (FileAttributes)fileAttributes;
@@ -270,6 +270,13 @@ internal sealed unsafe class WinFspRamAdapter : IFileSystem
         var node = Node(info);
         if (node?.Content == null)
             return V(FsResult.Error(NtStatus.ObjectNameNotFound));
+
+        if (setAllocationSize)
+        {
+            // AllocationSize is a pre-reservation hint. Do not change logical file size.
+            // For RAM disk, we don't pre-allocate pages — sparse allocation on write is sufficient.
+            return V(FsResult.Success(MakeFileInfo(node)));
+        }
 
         if (!node.Content.SetLength((long)newSize))
             return V(FsResult.Error(NtStatus.DiskFull));

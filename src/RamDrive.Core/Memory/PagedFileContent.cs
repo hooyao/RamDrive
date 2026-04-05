@@ -13,6 +13,7 @@ public sealed class PagedFileContent : IDisposable
     private readonly int _pageSize;
     private nint[] _pages;      // index → native page pointer; nint.Zero = not allocated
     private long _length;       // logical file size in bytes
+    private int _reservedPages; // pages reserved in pool but not yet allocated
     private readonly ReaderWriterLockSlim _lock = new(LockRecursionPolicy.NoRecursion);
     private bool _disposed;
 
@@ -130,6 +131,7 @@ public sealed class PagedFileContent : IDisposable
 
             int preAllocIdx = 0;
             int totalWritten = 0;
+            int reservationsConsumed = 0;
 
             while (totalWritten < source.Length)
             {
@@ -154,10 +156,19 @@ public sealed class PagedFileContent : IDisposable
                             // Return unused pre-allocated pages
                             if (preAllocated != null && preAllocIdx < preAllocatedCount)
                                 _pool.ReturnBatch(preAllocated[preAllocIdx..], preAllocatedCount - preAllocIdx);
+                            if (reservationsConsumed > 0)
+                            {
+                                _pool.Unreserve(reservationsConsumed);
+                                _reservedPages -= reservationsConsumed;
+                            }
                             return totalWritten > 0 ? totalWritten : -1;
                         }
                         _pages[pageIndex] = page;
                     }
+
+                    // This page slot was reserved by SetLength — consume the reservation
+                    if (_reservedPages > reservationsConsumed)
+                        reservationsConsumed++;
                 }
 
                 source.Slice(totalWritten, chunkSize)
@@ -169,6 +180,13 @@ public sealed class PagedFileContent : IDisposable
             // Return any excess pre-allocated pages (rare: another thread filled gaps between phases)
             if (preAllocated != null && preAllocIdx < preAllocatedCount)
                 _pool.ReturnBatch(preAllocated[preAllocIdx..], preAllocatedCount - preAllocIdx);
+
+            // Release consumed reservations (actual pages now replace the reservations)
+            if (reservationsConsumed > 0)
+            {
+                _pool.Unreserve(reservationsConsumed);
+                _reservedPages -= reservationsConsumed;
+            }
 
             if (endOffset > _length)
                 _length = endOffset;
@@ -183,16 +201,21 @@ public sealed class PagedFileContent : IDisposable
 
     /// <summary>
     /// Set logical file length. Truncation frees pages beyond the new length.
-    /// Extension does not allocate pages (sparse).
-    /// Returns false if extending would exceed capacity (based on max page count).
+    /// Extension reserves capacity in the pool (without allocating pages) to guarantee
+    /// that subsequent writes will succeed — required for kernel cache mode where the
+    /// cache manager calls SetFileSize before issuing writes.
+    /// Returns false if extending would exceed capacity.
     /// </summary>
     public bool SetLength(long newLength)
     {
+        if (newLength < 0) return false;
+
         _lock.EnterWriteLock();
         try
         {
             if (newLength < _length)
             {
+                // --- Truncation ---
                 int newPageCount = (int)((newLength + _pageSize - 1) / _pageSize);
 
                 // Zero partial data in the last retained page
@@ -211,7 +234,7 @@ public sealed class PagedFileContent : IDisposable
                     }
                 }
 
-                // Collect pages to free, then batch-return outside the hot path
+                // Collect pages to free, then batch-return
                 int toFreeCount = 0;
                 for (int i = newPageCount; i < _pages.Length; i++)
                 {
@@ -236,6 +259,40 @@ public sealed class PagedFileContent : IDisposable
 
                 if (newPageCount < _pages.Length)
                     Array.Resize(ref _pages, newPageCount);
+
+                // Release excess reservations
+                int oldRequired = (int)((_length + _pageSize - 1) / _pageSize);
+                int allocatedInRange = 0;
+                for (int i = 0; i < Math.Min(oldRequired, _pages.Length); i++)
+                {
+                    if (_pages[i] != nint.Zero)
+                        allocatedInRange++;
+                }
+                int newReserved = Math.Max(0, newPageCount - allocatedInRange);
+                int reserveDelta = _reservedPages - newReserved;
+                if (reserveDelta > 0)
+                {
+                    _pool.Unreserve(reserveDelta);
+                    _reservedPages = newReserved;
+                }
+            }
+            else if (newLength > _length)
+            {
+                // --- Extension: reserve capacity without allocating ---
+                int oldPageCount = (int)((_length + _pageSize - 1) / _pageSize);
+                int newPageCount = (int)((newLength + _pageSize - 1) / _pageSize);
+                int additionalPages = newPageCount - oldPageCount;
+
+                if (additionalPages > 0)
+                {
+                    if (!_pool.Reserve(additionalPages))
+                        return false;
+                    _reservedPages += additionalPages;
+                }
+
+                // Expand page table (entries stay nint.Zero — sparse)
+                if (newPageCount > _pages.Length)
+                    Array.Resize(ref _pages, newPageCount);
             }
 
             _length = newLength;
@@ -255,6 +312,13 @@ public sealed class PagedFileContent : IDisposable
         _lock.EnterWriteLock();
         try
         {
+            // Release any outstanding reservations
+            if (_reservedPages > 0)
+            {
+                _pool.Unreserve(_reservedPages);
+                _reservedPages = 0;
+            }
+
             for (int i = 0; i < _pages.Length; i++)
             {
                 if (_pages[i] != nint.Zero)
