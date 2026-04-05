@@ -74,7 +74,7 @@ jobs:
         shell: pwsh
         run: |
           $version = "${{ steps.version.outputs.VERSION }}"
-          Compress-Archive -Path publish-aot/RamDrive.exe, publish-aot/appsettings.jsonc -DestinationPath "RamDrive-$version.zip"
+          Compress-Archive -Path publish-aot/RamDrive.exe, publish-aot/appsettings.jsonc, Setup.bat -DestinationPath "RamDrive-$version.zip"
 
       - name: Create GitHub Release
         env:

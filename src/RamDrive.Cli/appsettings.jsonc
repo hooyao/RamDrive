@@ -22,6 +22,11 @@
     "PreAllocate": false,
 
     // Volume label shown in Windows Explorer.
-    "VolumeLabel": "RamDrive"
+    "VolumeLabel": "RamDrive",
+
+    // Let Windows kernel cache file data for reads and writes.
+    // Dramatically improves throughput (~3x) by serving repeated reads from OS page cache
+    // without calling back into user mode. Safe for RAM disk since we are the sole data source.
+    "EnableKernelCache": true
   }
 }

@@ -75,6 +75,14 @@ public interface IFileSystem
     //  Lifecycle (sync — called once, not on hot path)
     // ═══════════════════════════════════════════
 
+    /// <summary>
+    /// If true, Read/Write operations always complete synchronously (the returned ValueTask
+    /// is always already completed). This enables a zero-copy fast path where the kernel I/O
+    /// buffer is passed directly to ReadFile/WriteFile without intermediate rent/copy.
+    /// <para>Default is <c>false</c> (safe for async file systems — uses pooled buffer).</para>
+    /// </summary>
+    bool SynchronousIo => false;
+
     /// <summary>Called just before mount. Configure host properties here.</summary>
     int Init(FileSystemHost host) => NtStatus.Success;
 

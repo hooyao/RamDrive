@@ -6,6 +6,7 @@
   </Folder>
   <Folder Name="/tests/">
     <Project Path="tests/RamDrive.Core.Tests/RamDrive.Core.Tests.csproj" />
+    <Project Path="tests/RamDrive.Benchmarks/RamDrive.Benchmarks.csproj" />
   </Folder>
   <Folder Name="/examples/">
     <Project Path="examples/HelloFs/HelloFs.csproj" />

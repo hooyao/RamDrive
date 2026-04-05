@@ -3,6 +3,7 @@ using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
+using RamDrive.Cli;
 using RamDrive.Core.Configuration;
 using RamDrive.Core.FileSystem;
 using RamDrive.Core.Memory;
@@ -34,8 +35,8 @@ builder.ConfigureServices((context, services) =>
 
     services.AddSingleton<PagePool>();
     services.AddSingleton<RamFileSystem>();
-    services.AddSingleton<DokanRamAdapter>();
-    services.AddHostedService<DokanHostedService>();
+    services.AddSingleton<WinFspRamAdapter>();
+    services.AddHostedService<WinFspHostedService>();
 });
 
 var host = builder.Build();

@@ -79,46 +79,9 @@ public sealed unsafe class WinFspFileSystem : IDisposable
             return NtStatus.InvalidDeviceRequest; // already mounted
 
         string devicePath = VolumeParams.IsPrefixEmpty() ? FspApi.DiskDevicePath : FspApi.NetDevicePath;
-        Console.Error.WriteLine($"[WinFspFileSystem] _interfacePtr=0x{_interfacePtr:X}");
-        Console.Error.WriteLine($"[WinFspFileSystem] first 8 bytes at _interfacePtr: 0x{*(nint*)_interfacePtr:X}");
         int result = FspApi.FspFileSystemCreate(devicePath, _volumeParamsPtr, _interfacePtr, out _fileSystemPtr);
         if (result < 0)
-        {
-            Console.Error.WriteLine($"[WinFspFileSystem] FspFileSystemCreate failed: 0x{result:X8} (devicePath={devicePath})");
             return result;
-        }
-        Console.Error.WriteLine($"[WinFspFileSystem] FspFileSystemCreate OK, handle=0x{_fileSystemPtr:X}");
-
-        // Verify: read back the Interface pointer that WinFSP stored
-        // FSP_FILE_SYSTEM layout (x64):
-        //   Version(2) + pad(6) + UserContext(8) + VolumeName[64](128) + VolumeHandle(8)
-        //   + EnterOp(8) + LeaveOp(8) + Operations[22](176) + Interface(8)
-        //   = 8 + 8 + 128 + 8 + 8 + 8 + 176 = 344
-        nint storedInterface = *(nint*)((byte*)_fileSystemPtr + 344);
-        Console.Error.WriteLine($"[WinFspFileSystem] stored Interface ptr at offset 344 = 0x{storedInterface:X}");
-        Console.Error.WriteLine($"[WinFspFileSystem] our _interfacePtr = 0x{_interfacePtr:X}");
-        Console.Error.WriteLine($"[WinFspFileSystem] match: {storedInterface == _interfacePtr}");
-        if (storedInterface != _interfacePtr)
-        {
-            // Scan the struct for our pointer
-            for (int i = 0; i < 792; i += 8)
-            {
-                nint val = *(nint*)((byte*)_fileSystemPtr + i);
-                if (val == _interfacePtr)
-                    Console.Error.WriteLine($"[WinFspFileSystem] FOUND _interfacePtr at offset {i}!");
-            }
-            // Also read what's at offset 728 and dump its first few words
-            nint ptrAt728 = *(nint*)((byte*)_fileSystemPtr + 728);
-            Console.Error.WriteLine($"[WinFspFileSystem] ptr@728 = 0x{ptrAt728:X}");
-            if (ptrAt728 != 0)
-            {
-                for (int i = 0; i < 10; i++)
-                {
-                    nint word = *(nint*)((byte*)ptrAt728 + i * 8);
-                    Console.Error.WriteLine($"[WinFspFileSystem]   [{i}] = 0x{word:X}");
-                }
-            }
-        }
 
         // Store user context
         if (UserContext != 0)
@@ -130,20 +93,16 @@ public sealed unsafe class WinFspFileSystem : IDisposable
         result = FspApi.FspFileSystemSetMountPointEx(_fileSystemPtr, mountPoint, 0);
         if (result < 0)
         {
-            Console.Error.WriteLine($"[WinFspFileSystem] SetMountPoint failed: 0x{result:X8} (mountPoint={mountPoint})");
             DestroyFs();
             return result;
         }
-        Console.Error.WriteLine($"[WinFspFileSystem] SetMountPoint OK");
 
         result = FspApi.FspFileSystemStartDispatcher(_fileSystemPtr, threadCount);
         if (result < 0)
         {
-            Console.Error.WriteLine($"[WinFspFileSystem] StartDispatcher failed: 0x{result:X8}");
             DestroyFs();
             return result;
         }
-        Console.Error.WriteLine($"[WinFspFileSystem] StartDispatcher OK");
 
         return NtStatus.Success;
     }

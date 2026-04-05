@@ -1,3 +1,4 @@
+using System.Buffers;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using System.Runtime.Versioning;
@@ -18,7 +19,8 @@ public sealed unsafe partial class FileSystemHost : IDisposable
     private readonly IFileSystem _fs;
     private WinFspFileSystem? _rawFs;
     private GCHandle _selfHandle;
-    private readonly UnmanagedBufferPool _bufferPool = new();
+    private readonly PinnedBufferPool _bufferPool = new();
+    private bool _synchronousIo;
 
     public FileSystemHost(IFileSystem fileSystem)
     {
@@ -74,6 +76,8 @@ public sealed unsafe partial class FileSystemHost : IDisposable
         try { result = _fs.Init(this); }
         catch (Exception ex) { return HandleException(ex); }
         if (result < 0) return result;
+
+        _synchronousIo = _fs.SynchronousIo;
 
         // 2. Create low-level FS and configure VolumeParams
         _rawFs = new WinFspFileSystem();
@@ -377,7 +381,40 @@ public sealed unsafe partial class FileSystemHost : IDisposable
         finally { FreeHandle(ctx); }
     }
 
-    // ── Read/Write: unified ValueTask → sync or STATUS_PENDING ──
+    // ── Read/Write: sync FS = zero-copy (kernel buffer passed directly)
+    //                async FS = rent from PinnedBufferPool ──
+
+    /// <summary>
+    /// Thread-static native buffer wrapper. Avoids allocating MemoryManager per I/O.
+    /// Safe because WinFsp dispatcher threads process one request at a time.
+    /// Only used when <see cref="IFileSystem.SynchronousIo"/> is true.
+    /// </summary>
+    [ThreadStatic] private static NativeBufferMemory? t_nativeBuffer;
+
+    private static NativeBufferMemory GetNativeBuffer(nint ptr, int length)
+    {
+        var buf = t_nativeBuffer ??= new NativeBufferMemory();
+        buf.Reset(ptr, length);
+        return buf;
+    }
+
+    /// <summary>
+    /// Reusable MemoryManager that wraps a native pointer without owning it.
+    /// IMPORTANT: Dispose is intentionally a no-op — this buffer is thread-static and reused.
+    /// IFileSystem implementers must NOT dispose the Memory&lt;byte&gt; received in ReadFile/WriteFile.
+    /// </summary>
+    private sealed class NativeBufferMemory : MemoryManager<byte>
+    {
+        private nint _ptr;
+        private int _length;
+
+        public void Reset(nint ptr, int length) { _ptr = ptr; _length = length; }
+
+        public override Span<byte> GetSpan() => new((void*)_ptr, _length);
+        public override MemoryHandle Pin(int elementIndex = 0) => new((byte*)_ptr + elementIndex);
+        public override void Unpin() { }
+        protected override void Dispose(bool disposing) { /* no-op: thread-static, not owned */ }
+    }
 
     [UnmanagedCallersOnly(CallConvs = [typeof(CallConvCdecl)])]
     static int OnRead(nint fs, FspFullContext* ctx, nint buffer, ulong offset, uint length, uint* pBt)
@@ -386,23 +423,35 @@ public sealed unsafe partial class FileSystemHost : IDisposable
         try
         {
             var hs = H(ctx);
-            var owned = self._bufferPool.RentAsMemory((int)length);
-            var task = self._fs.ReadFile(hs.FileName!, owned.Memory, offset, hs.Info, hs.Info.CancellationToken);
 
-            if (task.IsCompletedSuccessfully)
+            if (self._synchronousIo)
             {
-                var r = task.Result;
+                // Zero-copy: wrap kernel buffer directly, pass to ReadFile
+                var directBuf = GetNativeBuffer(buffer, (int)length);
+                var task = self._fs.ReadFile(hs.FileName!, directBuf.Memory, offset, hs.Info, hs.Info.CancellationToken);
+                var r = task.IsCompletedSuccessfully ? task.Result : task.AsTask().GetAwaiter().GetResult();
+                *pBt = r.BytesTransferred;
+                return r.Status;
+            }
+
+            // Async-safe: rent buffer, ReadFile into it, copy to kernel buffer
+            var owned = self._bufferPool.Rent((int)length);
+            var asyncTask = self._fs.ReadFile(hs.FileName!, owned.Memory, offset, hs.Info, hs.Info.CancellationToken);
+
+            if (asyncTask.IsCompletedSuccessfully)
+            {
+                var r = asyncTask.Result;
                 if (r.Status >= 0 && r.BytesTransferred > 0)
-                    owned.CopyTo(new Span<byte>((void*)buffer, (int)length), (int)r.BytesTransferred);
+                    owned.Memory.Span[..(int)r.BytesTransferred].CopyTo(new Span<byte>((void*)buffer, (int)length));
                 owned.Dispose();
                 *pBt = r.BytesTransferred;
                 return r.Status;
             }
 
-            // Async path → STATUS_PENDING
+            // STATUS_PENDING
             var opCtx = FspApi.FspFileSystemGetOperationContext();
             var response = opCtx->Response;
-            task.AsTask().ContinueWith(t =>
+            asyncTask.AsTask().ContinueWith(t =>
             {
                 try
                 {
@@ -410,7 +459,7 @@ public sealed unsafe partial class FileSystemHost : IDisposable
                     {
                         var r = t.Result;
                         if (r.Status >= 0 && r.BytesTransferred > 0)
-                            owned.CopyTo(new Span<byte>((void*)buffer, (int)length), (int)r.BytesTransferred);
+                            owned.Memory.Span[..(int)r.BytesTransferred].CopyTo(new Span<byte>((void*)buffer, (int)length));
                         response->IoStatusStatus = r.Status;
                         response->IoStatusInformation = r.BytesTransferred;
                     }
@@ -448,24 +497,39 @@ public sealed unsafe partial class FileSystemHost : IDisposable
         try
         {
             var hs = H(ctx);
-            var owned = self._bufferPool.RentAsMemory((int)length);
-            owned.CopyFrom(new ReadOnlySpan<byte>((void*)buffer, (int)length));
 
-            var task = self._fs.WriteFile(hs.FileName!, owned.Memory, offset,
+            if (self._synchronousIo)
+            {
+                // Zero-copy: wrap kernel buffer directly, pass to WriteFile
+                var directBuf = GetNativeBuffer(buffer, (int)length);
+                var task = self._fs.WriteFile(hs.FileName!, directBuf.Memory, offset,
+                    wteof != 0, cio != 0, hs.Info, hs.Info.CancellationToken);
+                var r = task.IsCompletedSuccessfully ? task.Result : task.AsTask().GetAwaiter().GetResult();
+                *pBt = r.BytesTransferred;
+                if (r.Status >= 0) *pFi = r.FileInfo;
+                return r.Status;
+            }
+
+            // Async-safe: snapshot kernel buffer into pooled buffer
+            var owned = self._bufferPool.Rent((int)length);
+            new ReadOnlySpan<byte>((void*)buffer, (int)length).CopyTo(owned.Memory.Span);
+
+            var asyncTask = self._fs.WriteFile(hs.FileName!, owned.Memory, offset,
                 wteof != 0, cio != 0, hs.Info, hs.Info.CancellationToken);
 
-            if (task.IsCompletedSuccessfully)
+            if (asyncTask.IsCompletedSuccessfully)
             {
-                var r = task.Result;
+                var r = asyncTask.Result;
                 owned.Dispose();
                 *pBt = r.BytesTransferred;
                 if (r.Status >= 0) *pFi = r.FileInfo;
                 return r.Status;
             }
 
+            // STATUS_PENDING
             var opCtx = FspApi.FspFileSystemGetOperationContext();
             var response = opCtx->Response;
-            task.AsTask().ContinueWith(t =>
+            asyncTask.AsTask().ContinueWith(t =>
             {
                 try
                 {
@@ -545,6 +609,9 @@ public sealed unsafe partial class FileSystemHost : IDisposable
 
     // ── Simple sync callbacks ──
 
+    /// <summary>Shared sentinel for volume-level operations (no per-handle state).</summary>
+    private static readonly FileOperationInfo s_volumeInfo = new();
+
     [UnmanagedCallersOnly(CallConvs = [typeof(CallConvCdecl)])]
     static int OnFlush(nint fs, FspFullContext* ctx, FspFileInfo* pFi)
     {
@@ -552,7 +619,7 @@ public sealed unsafe partial class FileSystemHost : IDisposable
         try
         {
             var hs = ctx->UserContext2 != 0 ? H(ctx) : null;
-            var info = hs?.Info ?? new FileOperationInfo();
+            var info = hs?.Info ?? s_volumeInfo;
             var task = self._fs.FlushFileBuffers(hs?.FileName, info, info.CancellationToken);
             var r = task.IsCompletedSuccessfully ? task.Result : task.AsTask().GetAwaiter().GetResult();
             if (r.Status >= 0) *pFi = r.FileInfo;

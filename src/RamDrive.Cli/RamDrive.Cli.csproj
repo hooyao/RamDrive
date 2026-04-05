@@ -13,6 +13,7 @@
         <InvariantGlobalization>true</InvariantGlobalization>
         <UseSystemResourceKeys>true</UseSystemResourceKeys>
         <IlcFoldIdenticalMethodBodies>true</IlcFoldIdenticalMethodBodies>
+        <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
     </PropertyGroup>
 
     <!-- Release-only AOT flags: wide SIMD + smaller binary -->
@@ -27,6 +28,7 @@
 
     <ItemGroup>
         <ProjectReference Include="..\RamDrive.Core\RamDrive.Core.csproj"/>
+        <ProjectReference Include="..\WinFsp.Net\WinFsp.Net.csproj"/>
     </ItemGroup>
 
     <ItemGroup>

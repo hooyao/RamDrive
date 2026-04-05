@@ -7,4 +7,12 @@ public sealed class RamDriveOptions
     public int PageSizeKb { get; set; } = 64;
     public bool PreAllocate { get; set; }
     public string VolumeLabel { get; set; } = "RamDrive";
+
+    /// <summary>
+    /// Enable Windows kernel-level file data caching for reads and writes.
+    /// Dramatically improves throughput by letting the OS cache manager serve
+    /// repeated reads from memory without calling back into user mode.
+    /// Safe for RAM disk since we are the sole data source.
+    /// </summary>
+    public bool EnableKernelCache { get; set; } = true;
 }
