@@ -14,18 +14,12 @@ namespace WinFsp;
 /// Built on top of <see cref="WinFspFileSystem"/> (low-level API).
 /// </summary>
 [SupportedOSPlatform("windows")]
-public sealed unsafe partial class FileSystemHost : IDisposable
+public sealed unsafe partial class FileSystemHost(IFileSystem fileSystem) : IDisposable
 {
-    private readonly IFileSystem _fs;
+    private readonly IFileSystem _fs = fileSystem;
     private WinFspFileSystem? _rawFs;
     private GCHandle _selfHandle;
-    private readonly PinnedBufferPool _bufferPool = new();
     private bool _synchronousIo;
-
-    public FileSystemHost(IFileSystem fileSystem)
-    {
-        _fs = fileSystem;
-    }
 
     ~FileSystemHost() => Dispose(false);
 
@@ -133,7 +127,6 @@ public sealed unsafe partial class FileSystemHost : IDisposable
         _rawFs?.Dispose();
         _rawFs = null;
         if (_selfHandle.IsAllocated) _selfHandle.Free();
-        _bufferPool.Dispose();
     }
 
     // ═══════════════════════════════════════════
@@ -434,54 +427,51 @@ public sealed unsafe partial class FileSystemHost : IDisposable
                 return r.Status;
             }
 
-            // Async-safe: rent buffer, ReadFile into it, copy to kernel buffer
-            var owned = self._bufferPool.Rent((int)length);
-            var asyncTask = self._fs.ReadFile(hs.FileName!, owned.Memory, offset, hs.Info, hs.Info.CancellationToken);
+            // Zero-copy async: wrap kernel buffer directly — it stays valid until
+            // FspFileSystemSendResponse is called, so ReadFile can write into it
+            // on any thread. No pool rent/return, no extra memcpy.
+            var asyncBuf = new NativeBufferMemory();
+            asyncBuf.Reset(buffer, (int)length);
+            var asyncTask = self._fs.ReadFile(hs.FileName!, asyncBuf.Memory, offset, hs.Info, hs.Info.CancellationToken);
 
             if (asyncTask.IsCompletedSuccessfully)
             {
                 var r = asyncTask.Result;
-                if (r.Status >= 0 && r.BytesTransferred > 0)
-                    owned.Memory.Span[..(int)r.BytesTransferred].CopyTo(new Span<byte>((void*)buffer, (int)length));
-                owned.Dispose();
                 *pBt = r.BytesTransferred;
                 return r.Status;
             }
 
-            // STATUS_PENDING
-            var opCtx = FspApi.FspFileSystemGetOperationContext();
-            var response = opCtx->Response;
+            // STATUS_PENDING — must build a fresh response buffer (MEMFS pattern).
+            // The dispatcher's Response may be invalidated after we return STATUS_PENDING.
+            var hint = FspApi.FspFileSystemGetOperationContext()->Request->Hint;
             asyncTask.AsTask().ContinueWith(t =>
             {
+                var rsp = new FspTransactRsp();
+                rsp.Size = (ushort)sizeof(FspTransactRsp);
+                rsp.Kind = FspTransactKind.Read;
+                rsp.Hint = hint;
                 try
                 {
                     if (t.IsCompletedSuccessfully)
                     {
                         var r = t.Result;
-                        if (r.Status >= 0 && r.BytesTransferred > 0)
-                            owned.Memory.Span[..(int)r.BytesTransferred].CopyTo(new Span<byte>((void*)buffer, (int)length));
-                        response->IoStatusStatus = r.Status;
-                        response->IoStatusInformation = r.BytesTransferred;
+                        rsp.IoStatusStatus = r.Status;
+                        rsp.IoStatusInformation = r.BytesTransferred;
                     }
                     else if (t.IsCanceled)
                     {
-                        response->IoStatusStatus = NtStatus.Cancelled;
-                        response->IoStatusInformation = 0;
+                        rsp.IoStatusStatus = NtStatus.Cancelled;
                     }
                     else
                     {
-                        response->IoStatusStatus = NtStatus.UnexpectedIoError;
-                        response->IoStatusInformation = 0;
+                        rsp.IoStatusStatus = NtStatus.UnexpectedIoError;
                     }
-                    FspApi.FspFileSystemSendResponse(fs, response);
                 }
                 catch
                 {
-                    response->IoStatusStatus = NtStatus.UnexpectedIoError;
-                    response->IoStatusInformation = 0;
-                    FspApi.FspFileSystemSendResponse(fs, response);
+                    rsp.IoStatusStatus = NtStatus.UnexpectedIoError;
                 }
-                finally { owned.Dispose(); }
+                FspApi.FspFileSystemSendResponse(fs, &rsp);
             }, TaskContinuationOptions.ExecuteSynchronously);
             *pBt = 0;
             return NtStatus.Pending;
@@ -510,46 +500,46 @@ public sealed unsafe partial class FileSystemHost : IDisposable
                 return r.Status;
             }
 
-            // Async-safe: snapshot kernel buffer into pooled buffer
-            var owned = self._bufferPool.Rent((int)length);
-            new ReadOnlySpan<byte>((void*)buffer, (int)length).CopyTo(owned.Memory.Span);
+            // Zero-copy async: kernel buffer stays valid until FspFileSystemSendResponse
+            var asyncBuf = new NativeBufferMemory();
+            asyncBuf.Reset(buffer, (int)length);
 
-            var asyncTask = self._fs.WriteFile(hs.FileName!, owned.Memory, offset,
+            var asyncTask = self._fs.WriteFile(hs.FileName!, asyncBuf.Memory, offset,
                 wteof != 0, cio != 0, hs.Info, hs.Info.CancellationToken);
 
             if (asyncTask.IsCompletedSuccessfully)
             {
                 var r = asyncTask.Result;
-                owned.Dispose();
                 *pBt = r.BytesTransferred;
                 if (r.Status >= 0) *pFi = r.FileInfo;
                 return r.Status;
             }
 
-            // STATUS_PENDING
-            var opCtx = FspApi.FspFileSystemGetOperationContext();
-            var response = opCtx->Response;
+            // STATUS_PENDING — build fresh response (MEMFS pattern)
+            var hint = FspApi.FspFileSystemGetOperationContext()->Request->Hint;
             asyncTask.AsTask().ContinueWith(t =>
             {
+                var rsp = new FspTransactRsp();
+                rsp.Size = (ushort)sizeof(FspTransactRsp);
+                rsp.Kind = FspTransactKind.Write;
+                rsp.Hint = hint;
                 try
                 {
                     if (t.IsCompletedSuccessfully)
                     {
                         var r = t.Result;
-                        response->IoStatusStatus = r.Status;
-                        response->IoStatusInformation = r.BytesTransferred;
-                        if (r.Status >= 0) response->FileInfo = r.FileInfo;
+                        rsp.IoStatusStatus = r.Status;
+                        rsp.IoStatusInformation = r.BytesTransferred;
+                        if (r.Status >= 0) rsp.FileInfo = r.FileInfo;
                     }
-                    else if (t.IsCanceled) { response->IoStatusStatus = NtStatus.Cancelled; }
-                    else { response->IoStatusStatus = NtStatus.UnexpectedIoError; }
-                    FspApi.FspFileSystemSendResponse(fs, response);
+                    else if (t.IsCanceled) { rsp.IoStatusStatus = NtStatus.Cancelled; }
+                    else { rsp.IoStatusStatus = NtStatus.UnexpectedIoError; }
                 }
                 catch
                 {
-                    response->IoStatusStatus = NtStatus.UnexpectedIoError;
-                    FspApi.FspFileSystemSendResponse(fs, response);
+                    rsp.IoStatusStatus = NtStatus.UnexpectedIoError;
                 }
-                finally { owned.Dispose(); }
+                FspApi.FspFileSystemSendResponse(fs, &rsp);
             }, TaskContinuationOptions.ExecuteSynchronously);
             *pBt = 0;
             *pFi = default;
@@ -580,26 +570,29 @@ public sealed unsafe partial class FileSystemHost : IDisposable
                 return r.Status;
             }
 
-            var opCtx = FspApi.FspFileSystemGetOperationContext();
-            var response = opCtx->Response;
+            // STATUS_PENDING — build fresh response (MEMFS pattern)
+            var hint = FspApi.FspFileSystemGetOperationContext()->Request->Hint;
             task.AsTask().ContinueWith(t =>
             {
+                var rsp = new FspTransactRsp();
+                rsp.Size = (ushort)sizeof(FspTransactRsp);
+                rsp.Kind = FspTransactKind.QueryDirectory;
+                rsp.Hint = hint;
                 try
                 {
                     if (t.IsCompletedSuccessfully)
                     {
-                        response->IoStatusStatus = t.Result.Status;
-                        response->IoStatusInformation = t.Result.BytesTransferred;
+                        rsp.IoStatusStatus = t.Result.Status;
+                        rsp.IoStatusInformation = t.Result.BytesTransferred;
                     }
-                    else if (t.IsCanceled) { response->IoStatusStatus = NtStatus.Cancelled; }
-                    else { response->IoStatusStatus = NtStatus.UnexpectedIoError; }
-                    FspApi.FspFileSystemSendResponse(fs, response);
+                    else if (t.IsCanceled) { rsp.IoStatusStatus = NtStatus.Cancelled; }
+                    else { rsp.IoStatusStatus = NtStatus.UnexpectedIoError; }
                 }
                 catch
                 {
-                    response->IoStatusStatus = NtStatus.UnexpectedIoError;
-                    FspApi.FspFileSystemSendResponse(fs, response);
+                    rsp.IoStatusStatus = NtStatus.UnexpectedIoError;
                 }
+                FspApi.FspFileSystemSendResponse(fs, &rsp);
             }, TaskContinuationOptions.ExecuteSynchronously);
             *pBt = 0;
             return NtStatus.Pending;

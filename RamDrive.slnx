@@ -7,6 +7,7 @@
   <Folder Name="/tests/">
     <Project Path="tests/RamDrive.Core.Tests/RamDrive.Core.Tests.csproj" />
     <Project Path="tests/RamDrive.Benchmarks/RamDrive.Benchmarks.csproj" />
+    <Project Path="tests/WinFsp.Net.Tests/WinFsp.Net.Tests.csproj" />
   </Folder>
   <Folder Name="/examples/">
     <Project Path="examples/HelloFs/HelloFs.csproj" />
