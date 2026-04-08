@@ -68,7 +68,7 @@ jobs:
         run: |
           $projects = @(
             "tests/RamDrive.Core.Tests/RamDrive.Core.Tests.csproj",
-            "tests/WinFsp.Net.Tests/WinFsp.Net.Tests.csproj"
+            "tests/RamDrive.IntegrationTests/RamDrive.IntegrationTests.csproj"
           )
           $failed = $false
           foreach ($proj in $projects) {
