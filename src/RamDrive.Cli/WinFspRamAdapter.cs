@@ -4,7 +4,6 @@ using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using RamDrive.Core.Configuration;
 using RamDrive.Core.FileSystem;
-using WinFsp;
 using WinFsp.Native;
 
 namespace RamDrive.Cli;

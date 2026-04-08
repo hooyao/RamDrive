@@ -27,8 +27,11 @@
     </ItemGroup>
 
     <ItemGroup>
+        <PackageReference Include="WinFsp.Native"/>
+    </ItemGroup>
+
+    <ItemGroup>
         <ProjectReference Include="..\RamDrive.Core\RamDrive.Core.csproj"/>
-        <ProjectReference Include="..\WinFsp.Net\WinFsp.Net.csproj"/>
     </ItemGroup>
 
     <ItemGroup>

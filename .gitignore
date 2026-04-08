@@ -184,3 +184,9 @@ publish-aot/
 publish-test/
 dokan-dotnet/
 .claude/
+
+# TLA+ model checker artifacts
+tla/states/
+tla/*.bin
+tla/*_TTrace_*.tla
+tla/tla2tools.jar

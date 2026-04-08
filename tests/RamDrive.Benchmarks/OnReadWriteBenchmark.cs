@@ -8,8 +8,8 @@ using Microsoft.Extensions.Options;
 using RamDrive.Core.Configuration;
 using RamDrive.Core.FileSystem;
 using RamDrive.Core.Memory;
-using WinFsp;
 using WinFsp.Native;
+using WinFsp.Native.Interop;
 
 namespace RamDrive.Benchmarks;
 

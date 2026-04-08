@@ -11,16 +11,11 @@ dotnet build
 # Run (debug, from src/RamDrive.Cli)
 dotnet run --project src/RamDrive.Cli -- --RamDrive:MountPoint="R:\\" --RamDrive:CapacityMb=64
 
-# Run tests
+# Run tests (unit + integration — requires WinFsp installed)
 dotnet test
 
 # AOT publish (requires Visual Studio C++ Build Tools + vswhere in PATH)
 dotnet publish src/RamDrive.Cli/RamDrive.Cli.csproj -c Release -r win-x64 -o ./publish-aot
-
-# Functional test: start RamDrive in background, then operate on the mount point
-dotnet run --project src/RamDrive.Cli -- --RamDrive:MountPoint="R:\\" --RamDrive:CapacityMb=64 &
-sleep 8
-echo "test" > R:/test.txt && cat R:/test.txt && rm R:/test.txt
 ```
 
 **Prerequisites:** .NET 10 SDK, [WinFsp](https://winfsp.dev/rel/) 2.x (install with Developer files).
@@ -43,7 +38,7 @@ PagedFileContent (per-file nint[] page table + ReaderWriterLockSlim)
 PagePool (NativeMemory.AllocZeroed + ConcurrentStack<nint> free list)
 ```
 
-The WinFsp binding library (`src/WinFsp.Net/`) provides:
+The WinFsp binding is provided by the [`WinFsp.Native`](https://www.nuget.org/packages/WinFsp.Native) NuGet package (namespace `WinFsp.Native`), which offers:
 - `FileSystemHost` — high-level host bridging `IFileSystem` to native WinFsp
 - `WinFspFileSystem` — low-level API for direct function pointer manipulation
 - Full AOT-compatible P/Invoke layer with `[LibraryImport]` source generators
@@ -63,7 +58,7 @@ The WinFsp binding library (`src/WinFsp.Net/`) provides:
 - `nint[]` page table — index maps to native page pointer, `nint.Zero` = sparse (unallocated)
 - **Three-phase write** to minimize write-lock hold time:
   1. Read lock: scan which pages need allocation
-  2. No lock: batch-allocate pages from PagePool
+  2. No lock: unreserve own reservations (from `SetLength`), then batch-allocate pages from PagePool. Re-reserve on failure. (TLA+ verified — see `tla/PagePoolFixed.tla`)
   3. Write lock: assign page table entries + memcpy only
 - `ReaderWriterLockSlim` per file — concurrent reads don't block each other
 - Truncation zeros partial page data and batch-returns freed pages
@@ -74,7 +69,7 @@ The WinFsp binding library (`src/WinFsp.Net/`) provides:
 - Path format: backslash separated, root is `"\"`
 
 ### WinFspRamAdapter (RamDrive.Cli/WinFspRamAdapter.cs)
-- Implements `WinFsp.IFileSystem` for use with `FileSystemHost`
+- Implements `WinFsp.Native.IFileSystem` for use with `FileSystemHost`
 - Caches `FileNode` in `FileOperationInfo.Context` to avoid repeated path lookups
 - Deletion is deferred: `CanDelete` validates; actual removal in `Cleanup` when `CleanupFlags.Delete`
 - `WriteFile`: `writeToEndOfFile` flag means append; `constrainedIo` clamps to logical size
@@ -88,7 +83,62 @@ The WinFsp binding library (`src/WinFsp.Net/`) provides:
 - `GetFileSecurityByName` returns `securityDescriptor = null` (sdSize=0) — WinFsp skips access checks.
 - `ReadDirectory` uses native buffer with `WinFspFileSystem.AddDirInfo` / `EndDirInfo` — no IEnumerable allocation.
 - `SetMountPointEx` crashes on `"R:\"` (trailing backslash). Mount point format: `"R:"` = `DefineDosDevice` (invisible to disk tools), `"\\.\R:"` = Mount Manager (visible to all apps, requires admin or `MountUseMountmgrFromFSD=1` registry key). `WinFspHostedService` tries `\\.\R:` first, falls back to `R:` on failure.
-- Detailed WinFsp binding design and pitfalls documented in `docs/winfsp-net-redesign.md`.
+- **STATUS_PENDING async**: Must build a fresh stack-allocated `FspTransactRsp` with `Size`/`Kind`/`Hint` fields. Do NOT reuse `OperationContext->Response` — it may be invalidated after returning `STATUS_PENDING`. Save `Request->Hint` before returning, echo it back in the response.
+- **Test mounts must use UNC paths** (`host.Prefix = @"\winfsp-tests\name"`; `host.Mount(null)`), not drive letters. Drive letter mounts become zombie on process crash and hang Explorer/entire system.
+- Detailed WinFsp binding design documented in the [`winfsp-native`](https://github.com/hooyao/winfsp-native) repository.
+
+## Testing
+
+### Unit Tests (`tests/RamDrive.Core.Tests/`)
+Standard xUnit tests for core data structures (PagePool, PagedFileContent, RamFileSystem).
+
+### Integration Tests (`tests/RamDrive.IntegrationTests/`)
+Self-hosted WinFsp integration tests. The test fixture boots its own `FileSystemHost` with UNC mount (`\\winfsp-tests\itest-{pid}`) — no external drive letter needed, safe on crash.
+
+```bash
+# Run all (structured torture + chaos fuzzer, ~45s)
+dotnet test tests/RamDrive.IntegrationTests
+
+# Run only chaos fuzzer
+dotnet test tests/RamDrive.IntegrationTests --filter ChaosTests
+
+# Long soak run (12 hours, 64 workers)
+CHAOS_DURATION_SEC=43200 CHAOS_WORKERS=64 dotnet test tests/RamDrive.IntegrationTests --filter ChaosTests
+```
+
+**TortureTests** — 10 structured concurrent tests:
+Sequential write+read, random offset R/W, concurrent append, create/delete churn, directory tree stress, overwrite+truncate+extend, mid-operation cancellation, rename under load, capacity pressure, mixed workload (100 tasks). All verify data integrity byte-by-byte.
+
+**ChaosTests** — random fuzzer:
+32 worker threads randomly pick from 14 weighted FS operations (CreateFile, WriteSeek, WriteAppend, ReadVerify, Truncate, Extend, Overwrite, Delete, Rename, SetAttr, Flush, CreateDir, DeleteDir, ListDir). Every write is tracked with SHA256; every read is verified. Duration configurable via `CHAOS_DURATION_SEC` env var (default 30s). Prints live ops/sec stats every 5s.
+
+### Benchmarks (`tests/RamDrive.Benchmarks/`)
+BenchmarkDotNet performance tests simulating the full `FileSystemHost` Read/Write call chain.
+
+```bash
+dotnet run --project tests/RamDrive.Benchmarks -c Release -- onread   # I/O throughput
+dotnet run --project tests/RamDrive.Benchmarks -c Release -- e2e      # end-to-end via mounted FS
+```
+
+## Formal Verification (`tla/`)
+
+TLA+ models for the PagePool reservation protocol, verified with TLC model checker.
+
+**Background:** Kernel cache mode (`EnableKernelCache=true`) causes Windows to call `SetFileSize` (which reserves pages via `PagePool.Reserve`) before issuing `WriteFile` (which allocates pages via `PagePool.Rent`). The original code had `AllocateNewPageIfUnderCapacity` check `allocated + reserved >= maxPages`, which counted the caller's own reservations against it — causing spurious `STATUS_DISK_FULL` under concurrent file copies.
+
+```bash
+# Requires Java 11+
+# Reproduce the bug (invariant NoSpuriousDiskFull violated)
+java -jar tla/tla2tools.jar tla/PagePoolReservation.tla
+
+# Verify the fix (all invariants + liveness pass)
+java -jar tla/tla2tools.jar tla/PagePoolFixed.tla
+```
+
+- `tla/PagePoolReservation.tla` — buggy model: `NoSpuriousDiskFull` violated in 5 states
+- `tla/PagePoolFixed.tla` — fixed model: Write Phase 2 unreserves own reservations before `RentBatch`, then re-reserves on failure. Verified with MaxPages={4,6,8} × NumFiles={2,3,4}, all invariants (TypeOK, PoolConsistent, NoCapacityLeak, NoSpuriousDiskFull) + liveness pass.
+
+**Fix in code** (`PagedFileContent.Write` Phase 2): `Unreserve(min(fileReserved, needed))` before `RentBatch`, restore on failure. Phase 3 fallback `Rent()` path also unreserves one slot if available. This matches the TLA+ `PagePoolFixed.DoPhase2` spec.
 
 ## AOT Configuration
 

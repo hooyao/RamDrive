@@ -167,7 +167,7 @@ public sealed class PagePool : IDisposable
 
         while (_allPages.TryPop(out nint page))
         {
-            unsafe { NativeMemory.Free((void*)page); }
+            unsafe { NativeMemory.AlignedFree((void*)page); }
         }
     }
 
@@ -194,7 +194,8 @@ public sealed class PagePool : IDisposable
 
     private unsafe nint AllocateNativePage()
     {
-        void* ptr = NativeMemory.AllocZeroed((nuint)_pageSize);
+        void* ptr = NativeMemory.AlignedAlloc((nuint)_pageSize, (nuint)_pageSize);
+        NativeMemory.Clear(ptr, (nuint)_pageSize);
         nint page = (nint)ptr;
         _allPages.Push(page);
         return page;

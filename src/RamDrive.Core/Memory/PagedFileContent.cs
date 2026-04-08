@@ -107,22 +107,39 @@ public sealed class PagedFileContent : IDisposable
         }
 
         // --- Phase 2: batch-allocate pages outside any lock ---
+        // Unreserve own reservations first so AllocateNewPageIfUnderCapacity
+        // can use that capacity. Verified correct by TLA+ model (tla/PagePoolFixed.tla).
         nint[]? preAllocated = null;
         int preAllocatedCount = 0;
+        int unreservedForAlloc = 0;
         if (neededCount > 0)
         {
+            int currentReserved = Volatile.Read(ref _reservedPages);
+            if (currentReserved > 0)
+            {
+                unreservedForAlloc = Math.Min(currentReserved, neededCount);
+                _pool.Unreserve(unreservedForAlloc);
+                Interlocked.Add(ref _reservedPages, -unreservedForAlloc);
+            }
+
             preAllocated = new nint[neededCount];
             preAllocatedCount = _pool.RentBatch(preAllocated, neededCount);
             if (preAllocatedCount < neededCount)
             {
-                // Not enough capacity — return what we got and fail
+                // Not enough capacity — return what we got, restore reservations, and fail
                 if (preAllocatedCount > 0)
                     _pool.ReturnBatch(preAllocated, preAllocatedCount);
+                if (unreservedForAlloc > 0)
+                {
+                    _pool.Reserve(unreservedForAlloc);
+                    Interlocked.Add(ref _reservedPages, unreservedForAlloc);
+                }
                 return -1;
             }
         }
 
         // --- Phase 3: write lock — only page table + memcpy, no OS allocations ---
+        // Reservations already consumed in Phase 2 via Unreserve.
         _lock.EnterWriteLock();
         try
         {
@@ -131,7 +148,6 @@ public sealed class PagedFileContent : IDisposable
 
             int preAllocIdx = 0;
             int totalWritten = 0;
-            int reservationsConsumed = 0;
 
             while (totalWritten < source.Length)
             {
@@ -150,25 +166,23 @@ public sealed class PagedFileContent : IDisposable
                     {
                         // Race condition: another thread allocated between our read-lock scan
                         // and write-lock acquisition. Fall back to single Rent.
+                        // Unreserve one slot if available so Rent can succeed.
+                        int curReserved = Volatile.Read(ref _reservedPages);
+                        if (curReserved > 0)
+                        {
+                            _pool.Unreserve(1);
+                            Interlocked.Decrement(ref _reservedPages);
+                        }
                         nint page = _pool.Rent();
                         if (page == nint.Zero)
                         {
                             // Return unused pre-allocated pages
                             if (preAllocated != null && preAllocIdx < preAllocatedCount)
                                 _pool.ReturnBatch(preAllocated[preAllocIdx..], preAllocatedCount - preAllocIdx);
-                            if (reservationsConsumed > 0)
-                            {
-                                _pool.Unreserve(reservationsConsumed);
-                                _reservedPages -= reservationsConsumed;
-                            }
                             return totalWritten > 0 ? totalWritten : -1;
                         }
                         _pages[pageIndex] = page;
                     }
-
-                    // This page slot was reserved by SetLength — consume the reservation
-                    if (_reservedPages > reservationsConsumed)
-                        reservationsConsumed++;
                 }
 
                 source.Slice(totalWritten, chunkSize)
@@ -180,13 +194,6 @@ public sealed class PagedFileContent : IDisposable
             // Return any excess pre-allocated pages (rare: another thread filled gaps between phases)
             if (preAllocated != null && preAllocIdx < preAllocatedCount)
                 _pool.ReturnBatch(preAllocated[preAllocIdx..], preAllocatedCount - preAllocIdx);
-
-            // Release consumed reservations (actual pages now replace the reservations)
-            if (reservationsConsumed > 0)
-            {
-                _pool.Unreserve(reservationsConsumed);
-                _reservedPages -= reservationsConsumed;
-            }
 
             if (endOffset > _length)
                 _length = endOffset;
