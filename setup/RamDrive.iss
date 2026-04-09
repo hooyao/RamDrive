@@ -103,6 +103,14 @@ begin
   end;
 end;
 
+procedure ConfigureWinFspMountManager;
+begin
+  // Enable Mount Manager for non-admin mounts so the drive is visible to all apps
+  RegWriteDWordValue(HKLM,
+       'SOFTWARE\WOW6432Node\WinFsp',
+       'MountUseMountmgrFromFSD', 1);
+end;
+
 procedure CreateService;
 var
   ResultCode: Integer;
@@ -143,6 +151,9 @@ begin
     // Install WinFsp if selected and not already present
     if WizardIsComponentSelected('winfsp') and not IsWinFspInstalled then
       InstallWinFsp;
+
+    // Enable Mount Manager so non-admin mounts are visible to all apps
+    ConfigureWinFspMountManager;
 
     // Stop existing service before re-registering
     if IsServiceInstalled then
