@@ -67,24 +67,101 @@ Name: "{group}\Restart Service";      Filename: "cmd.exe"; Parameters: "/c sc.ex
 Name: "{group}\Uninstall {#MyAppName}"; Filename: "{uninstallexe}"
 
 [Code]
+
+// Windows API for UpDown (spin) control
+function CreateWindowEx(dwExStyle: Cardinal; lpClassName, lpWindowName: String;
+  dwStyle: Cardinal; X, Y, nWidth, nHeight: Integer; hWndParent: HWND;
+  hMenu, hInstance, lpParam: Integer): HWND;
+  external 'CreateWindowExW@user32.dll stdcall';
+function SendMsg(hWnd: HWND; Msg: Cardinal; wParam, lParam: Integer): Integer;
+  external 'SendMessageW@user32.dll stdcall';
+
+const
+  UDS_SETBUDDYINT = $0002;
+  UDS_ALIGNRIGHT  = $0004;
+  UDS_ARROWKEYS   = $0020;
+  UDS_NOTHOUSANDS = $0080;
+  UDM_SETBUDDY    = $0469;
+  UDM_SETRANGE32  = $046F;
+  UDM_SETPOS32    = $0471;
+
 var
-  ConfigPage: TInputQueryWizardPage;
+  ConfigPage: TWizardPage;
+  DriveCombo: TNewComboBox;
+  CapacityEdit: TNewEdit;
+  CreateTempCheckbox: TNewCheckBox;
 
 procedure InitializeWizard;
+var
+  Lbl: TNewStaticText;
+  InfoLbl: TNewStaticText;
+  UpDown: HWND;
+  I: Integer;
 begin
-  ConfigPage := CreateInputQueryPage(wpSelectTasks,
+  ConfigPage := CreateCustomPage(wpSelectTasks,
     'RamDrive Configuration',
-    'Configure the RAM disk settings.',
-    'Choose a drive letter and capacity. To change these later:' + #13#10 +
+    'Configure the RAM disk settings.');
+
+  // --- Drive letter dropdown ---
+  Lbl := TNewStaticText.Create(ConfigPage);
+  Lbl.Parent := ConfigPage.Surface;
+  Lbl.Caption := 'Drive letter:';
+  Lbl.Top := 0;
+  Lbl.Left := 0;
+
+  DriveCombo := TNewComboBox.Create(ConfigPage);
+  DriveCombo.Parent := ConfigPage.Surface;
+  DriveCombo.Style := csDropDownList;
+  DriveCombo.Top := Lbl.Top + Lbl.Height + 4;
+  DriveCombo.Left := 0;
+  DriveCombo.Width := 80;
+  for I := Ord('D') to Ord('Z') do
+    DriveCombo.Items.Add(Chr(I) + ':');
+  DriveCombo.ItemIndex := DriveCombo.Items.IndexOf('R:');
+
+  // --- Capacity spin edit ---
+  Lbl := TNewStaticText.Create(ConfigPage);
+  Lbl.Parent := ConfigPage.Surface;
+  Lbl.Caption := 'Capacity (MB):';
+  Lbl.Top := DriveCombo.Top + DriveCombo.Height + 16;
+  Lbl.Left := 0;
+
+  CapacityEdit := TNewEdit.Create(ConfigPage);
+  CapacityEdit.Parent := ConfigPage.Surface;
+  CapacityEdit.Top := Lbl.Top + Lbl.Height + 4;
+  CapacityEdit.Left := 0;
+  CapacityEdit.Width := 120;
+  CapacityEdit.Text := '2048';
+
+  // Attach a native Windows UpDown control to the edit box
+  UpDown := CreateWindowEx(0, 'msctls_updown32', '',
+    $40000000 or $10000000 or UDS_SETBUDDYINT or UDS_ALIGNRIGHT or UDS_ARROWKEYS or UDS_NOTHOUSANDS,
+    0, 0, 0, 0, ConfigPage.Surface.Handle, 0, 0, 0);
+  SendMsg(UpDown, UDM_SETBUDDY, CapacityEdit.Handle, 0);
+  SendMsg(UpDown, UDM_SETRANGE32, 16, 131072);  // 16 MB .. 128 GB
+  SendMsg(UpDown, UDM_SETPOS32, 0, 2048);
+
+  // --- Create Temp directory checkbox ---
+  CreateTempCheckbox := TNewCheckBox.Create(ConfigPage);
+  CreateTempCheckbox.Parent := ConfigPage.Surface;
+  CreateTempCheckbox.Top := CapacityEdit.Top + CapacityEdit.Height + 20;
+  CreateTempCheckbox.Left := 0;
+  CreateTempCheckbox.Width := ConfigPage.SurfaceWidth;
+  CreateTempCheckbox.Height := ScaleY(20);
+  CreateTempCheckbox.Caption := 'Create a Temp directory on the RAM disk at startup';
+  CreateTempCheckbox.Checked := False;
+
+  // --- Info label ---
+  InfoLbl := TNewStaticText.Create(ConfigPage);
+  InfoLbl.Parent := ConfigPage.Surface;
+  InfoLbl.WordWrap := True;
+  InfoLbl.Top := CreateTempCheckbox.Top + CreateTempCheckbox.Height + 20;
+  InfoLbl.Left := 0;
+  InfoLbl.Width := ConfigPage.SurfaceWidth;
+  InfoLbl.Caption :=
+    'To change these settings after installation:' + #13#10 +
     '1. Edit appsettings.jsonc (Start Menu > RamDrive > Edit Configuration)' + #13#10 +
-    '2. Restart the service: run "sc.exe stop RamDrive && sc.exe start RamDrive"' + #13#10 +
-    '   or use Start Menu > RamDrive > Restart Service');
-
-  ConfigPage.Add('Drive letter (e.g. R):', False);
-  ConfigPage.Add('Capacity in MB (e.g. 2048 = 2 GB):', False);
-
-  ConfigPage.Values[0] := 'R';
-  ConfigPage.Values[1] := '2048';
+    '2. Restart the service (Start Menu > RamDrive > Restart Service)';
 end;
 
 function IsWinFspInstalled: Boolean;
@@ -104,26 +181,21 @@ end;
 
 function NextButtonClick(CurPageID: Integer): Boolean;
 var
-  Letter: String;
-  Cap: String;
   CapVal: Integer;
 begin
   Result := True;
   if CurPageID = ConfigPage.ID then
   begin
-    Letter := Trim(ConfigPage.Values[0]);
-    Cap := Trim(ConfigPage.Values[1]);
-
-    // Validate drive letter
-    if (Length(Letter) <> 1) or ((Letter[1] < 'A') or (Letter[1] > 'Z')) and ((Letter[1] < 'a') or (Letter[1] > 'z')) then
+    // Drive letter is from dropdown, always valid
+    if DriveCombo.ItemIndex < 0 then
     begin
-      MsgBox('Please enter a single drive letter (A-Z).', mbError, MB_OK);
+      MsgBox('Please select a drive letter.', mbError, MB_OK);
       Result := False;
       Exit;
     end;
 
-    // Validate capacity
-    CapVal := StrToIntDef(Cap, 0);
+    // Validate capacity (UpDown enforces range, but user can type directly)
+    CapVal := StrToIntDef(Trim(CapacityEdit.Text), 0);
     if CapVal < 16 then
     begin
       MsgBox('Capacity must be at least 16 MB.', mbError, MB_OK);
@@ -133,17 +205,43 @@ begin
   end;
 end;
 
+procedure KillProcess(ExeName: String);
+var
+  ResultCode: Integer;
+begin
+  Exec('powershell.exe', '-NoProfile -Command "Stop-Process -Name ''' + ExeName + ''' -Force -ErrorAction SilentlyContinue"',
+       '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+end;
+
 procedure StopAndDeleteService;
 var
   ScExe: String;
   ResultCode: Integer;
+  Retries: Integer;
 begin
   ScExe := ExpandConstant('{sysnative}\sc.exe');
   if not FileExists(ScExe) then
     ScExe := ExpandConstant('{sys}\sc.exe');
+
+  // Stop the service
   Exec(ScExe, 'stop RamDrive', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
-  Sleep(2000);
+
+  // Kill the process to speed up stop (WinFsp unmount can be slow)
+  KillProcess('RamDrive');
+
+  // Delete the service
   Exec(ScExe, 'delete RamDrive', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+
+  // Wait until SCM fully removes it (sc.exe query returns error 1060)
+  Retries := 0;
+  while Retries < 20 do
+  begin
+    Exec(ScExe, 'query RamDrive', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+    if ResultCode <> 0 then
+      Break;  // Service is gone
+    Sleep(500);
+    Retries := Retries + 1;
+  end;
 end;
 
 procedure InstallWinFsp;
@@ -173,10 +271,15 @@ var
   ConfigPath: String;
   Letter: String;
   Cap: String;
+  CreateTemp: String;
   Lines: TArrayOfString;
 begin
-  Letter := UpperCase(Trim(ConfigPage.Values[0]));
-  Cap := Trim(ConfigPage.Values[1]);
+  Letter := Copy(DriveCombo.Items[DriveCombo.ItemIndex], 1, 1);
+  Cap := Trim(CapacityEdit.Text);
+  if CreateTempCheckbox.Checked then
+    CreateTemp := 'true'
+  else
+    CreateTemp := 'false';
   ConfigPath := ExpandConstant('{app}\appsettings.jsonc');
 
   SetArrayLength(Lines, 20);
@@ -194,10 +297,11 @@ begin
   Lines[11] := '    "PageSizeKb": 64,';
   Lines[12] := '    "PreAllocate": false,';
   Lines[13] := '    "VolumeLabel": "RamDrive",';
-  Lines[14] := '    "EnableKernelCache": true';
-  Lines[15] := '  }';
-  Lines[16] := '}';
-  Lines[17] := '';
+  Lines[14] := '    "EnableKernelCache": true,';
+  Lines[15] := '    "CreateTempDirectory": ' + CreateTemp;
+  Lines[16] := '  }';
+  Lines[17] := '}';
+  Lines[18] := '';
 
   SaveStringsToUTF8File(ConfigPath, Lines, False);
 end;
@@ -206,28 +310,24 @@ procedure CreateService;
 var
   ExePath: String;
   ScExe: String;
-  SvcKey: String;
   ResultCode: Integer;
 begin
   ExePath := ExpandConstant('{app}\{#MyAppExeName}');
-  SvcKey := 'SYSTEM\CurrentControlSet\Services\RamDrive';
   // Use native sc.exe to avoid WOW64 redirection in 32-bit installer
   ScExe := ExpandConstant('{sysnative}\sc.exe');
   if not FileExists(ScExe) then
     ScExe := ExpandConstant('{sys}\sc.exe');
 
-  // Create service via SCM so it is immediately startable (no reboot needed)
-  if not Exec(ScExe,
+  // Create service via SCM (immediately startable, no reboot needed)
+  Exec(ScExe,
        'create RamDrive binPath= "' + ExePath + '" start= auto DisplayName= "RamDrive RAM Disk"',
-       '', SW_HIDE, ewWaitUntilTerminated, ResultCode) or (ResultCode <> 0) then
+       '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  if ResultCode <> 0 then
   begin
-    // Fallback: write registry directly (requires reboot for SCM to pick up)
-    RegWriteDWordValue(HKLM, SvcKey, 'Type', 16);
-    RegWriteDWordValue(HKLM, SvcKey, 'Start', 2);
-    RegWriteDWordValue(HKLM, SvcKey, 'ErrorControl', 1);
-    RegWriteExpandStringValue(HKLM, SvcKey, 'ImagePath', '"' + ExePath + '"');
-    RegWriteStringValue(HKLM, SvcKey, 'ObjectName', 'LocalSystem');
-    RegWriteStringValue(HKLM, SvcKey, 'DisplayName', 'RamDrive RAM Disk');
+    MsgBox('Failed to register Windows Service (sc.exe exit code: ' + IntToStr(ResultCode) + ').' + #13#10 +
+           'You can register manually: sc.exe create RamDrive binPath= "' + ExePath + '" start= auto',
+           mbError, MB_OK);
+    Exit;
   end;
 
   // Description
@@ -239,12 +339,57 @@ begin
        '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
 
   // Start in early service group (before most user-mode services)
-  RegWriteStringValue(HKLM, SvcKey, 'Group', 'FSFilter Activity Monitor');
+  RegWriteStringValue(HKLM,
+       'SYSTEM\CurrentControlSet\Services\RamDrive',
+       'Group', 'FSFilter Activity Monitor');
+end;
+
+procedure StartService;
+var
+  ScExe: String;
+  ResultCode: Integer;
+begin
+  ScExe := ExpandConstant('{sysnative}\sc.exe');
+  if not FileExists(ScExe) then
+    ScExe := ExpandConstant('{sys}\sc.exe');
+  Exec(ScExe, 'start RamDrive', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+end;
+
+function IsRamDriveRunning: Boolean;
+var
+  ResultCode: Integer;
+begin
+  Exec('powershell.exe',
+       '-NoProfile -Command "if (Get-Process -Name RamDrive -ErrorAction SilentlyContinue) { exit 0 } else { exit 1 }"',
+       '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  Result := (ResultCode = 0);
 end;
 
 function InitializeSetup: Boolean;
+var
+  Choice: Integer;
 begin
   Result := True;
+
+  if IsRamDriveRunning then
+  begin
+    Choice := MsgBox('RamDrive is currently running.' + #13#10 + #13#10 +
+                      'The installer needs to stop it before proceeding. ' +
+                      'Any data on the RAM disk will be lost.' + #13#10 + #13#10 +
+                      'Stop RamDrive and continue installation?',
+                      mbConfirmation, MB_YESNO);
+    if Choice = IDYES then
+    begin
+      if IsServiceInstalled then
+        StopAndDeleteService;
+      KillProcess('RamDrive');
+      Sleep(2000);
+    end
+    else
+    begin
+      Result := False;
+    end;
+  end;
 end;
 
 procedure CurStepChanged(CurStep: TSetupStep);
@@ -265,9 +410,12 @@ begin
     if IsServiceInstalled then
       StopAndDeleteService;
 
-    // Register Windows Service if selected
+    // Register and start Windows Service if selected
     if WizardIsComponentSelected('service') then
+    begin
       CreateService;
+      StartService;
+    end;
   end;
 end;
 
@@ -275,19 +423,16 @@ procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
 begin
   if CurUninstallStep = usUninstall then
   begin
-    // Stop and remove the service
+    // Stop service first, then kill any remaining process
     if IsServiceInstalled then
       StopAndDeleteService;
+    KillProcess('RamDrive');
+    Sleep(1000);
   end;
 end;
 
 [Run]
-; Optionally start the service right after install
-Filename: "{sysnative}\sc.exe"; Parameters: "start RamDrive"; \
-  StatusMsg: "Starting RamDrive service..."; \
-  Flags: runhidden nowait; Components: service
-
-; Or launch the app directly (green mode)
+; Launch the app directly (green mode only, service mode started in CurStepChanged)
 Filename: "{app}\{#MyAppExeName}"; \
   Description: "Launch {#MyAppName} now"; \
   Flags: nowait postinstall skipifsilent; Components: not service

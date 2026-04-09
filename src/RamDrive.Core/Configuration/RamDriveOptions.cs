@@ -15,4 +15,10 @@ public sealed class RamDriveOptions
     /// Safe for RAM disk since we are the sole data source.
     /// </summary>
     public bool EnableKernelCache { get; set; } = true;
+
+    /// <summary>
+    /// Create a Temp directory at the root of the RAM disk after mounting.
+    /// Useful for redirecting TEMP/TMP environment variables to the RAM disk.
+    /// </summary>
+    public bool CreateTempDirectory { get; set; }
 }

@@ -154,6 +154,50 @@ Release-only flags (in `RamDrive.Cli.csproj` under `Release` condition):
 
 **Serilog was intentionally removed** in favor of `Microsoft.Extensions.Logging` + `SimpleConsole` to maintain AOT compatibility. Do not re-add Serilog.
 
+## Windows Service
+
+The same `RamDrive.exe` runs as both a console app and a Windows Service. `UseWindowsService()` auto-detects the execution context. Console mode uses `SimpleConsole` logging; service mode additionally writes to Windows EventLog (`Application` log, source `RamDrive`).
+
+```powershell
+# Register (one-time, admin)
+sc.exe create RamDrive binPath= "C:\path\to\RamDrive.exe" start= auto
+sc.exe failure RamDrive reset= 60 actions= restart/5000/restart/10000/restart/30000
+
+# Unregister
+sc.exe stop RamDrive & sc.exe delete RamDrive
+```
+
+The installer handles registration/unregistration automatically.
+
+## Installer (`setup/RamDrive.iss`)
+
+Inno Setup 6.7+ script that produces a single `RamDrive-X.Y.Z-setup.exe`. Requires [Inno Setup](https://jrsoftware.org/isinfo.php) and the WinFsp MSI in `setup/`.
+
+```bash
+# Local build (requires Inno Setup installed, WinFsp MSI in setup/, AOT output in publish-aot/)
+ISCC.exe setup/RamDrive.iss
+# Output: installer-output/RamDrive-{version}-setup.exe
+```
+
+**Three install types:** Full (RamDrive + WinFsp + Windows Service), Green/Portable (exe only), Custom.
+
+**Wizard features:**
+- Drive letter dropdown (D:–Z:) and capacity spin edit (16 MB–128 GB)
+- Bundles and silently installs WinFsp MSI if not already present
+- Sets `MountUseMountmgrFromFSD=1` registry key for non-admin Mount Manager mounts
+- Registers Windows Service via `{sysnative}\sc.exe` (bypasses WOW64 redirect in 32-bit installer)
+- Start Menu shortcuts: app, Edit Configuration (notepad → appsettings.jsonc), Restart Service
+
+**Service registration details:**
+- `StopAndDeleteService` polls `sc.exe query` until SCM fully removes the old service before creating a new one — avoids the Windows race where a pending-delete service shadows the new creation.
+- Service starts immediately in `CurStepChanged(ssPostInstall)` via `[Code]`, not `[Run]` section (the `[Run]` `{sysnative}` expansion was unreliable).
+- `FSFilter Activity Monitor` service group for early boot ordering.
+- Failure recovery: restart after 5s / 10s / 30s.
+
+**Uninstall:** stops service, deletes via SCM, kills lingering `RamDrive.exe` process, then removes files.
+
+**CI integration:** The release workflow (`release.yml`) downloads the WinFsp MSI, installs Inno Setup via Chocolatey, patches the version, compiles, and uploads both `.zip` and `-setup.exe` to the GitHub Release.
+
 ## Release Process
 
 Push a tag matching `release-X.Y.Z` to trigger the release workflow:
@@ -162,7 +206,7 @@ git tag release-1.0.0
 git push origin release-1.0.0
 ```
 
-The workflow builds AOT, packages `RamDrive.exe` + `appsettings.jsonc`, and creates a GitHub Release.
+The workflow builds AOT, packages `RamDrive.exe` + `appsettings.jsonc`, builds the Inno Setup installer, and creates a GitHub Release with both the zip and setup exe.
 
 ## Configuration
 

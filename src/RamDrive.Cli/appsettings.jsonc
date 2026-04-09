@@ -27,6 +27,10 @@
     // Let Windows kernel cache file data for reads and writes.
     // Dramatically improves throughput (~3x) by serving repeated reads from OS page cache
     // without calling back into user mode. Safe for RAM disk since we are the sole data source.
-    "EnableKernelCache": true
+    "EnableKernelCache": true,
+
+    // Create a Temp directory at the root of the RAM disk after mounting.
+    // Useful for redirecting TEMP/TMP environment variables to the RAM disk.
+    "CreateTempDirectory": false
   }
 }

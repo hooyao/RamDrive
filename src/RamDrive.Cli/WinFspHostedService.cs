@@ -4,6 +4,7 @@ using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using Microsoft.Win32;
 using RamDrive.Core.Configuration;
+using RamDrive.Core.FileSystem;
 using WinFsp.Native;
 
 namespace RamDrive.Cli;
@@ -12,6 +13,7 @@ namespace RamDrive.Cli;
 internal sealed class WinFspHostedService : BackgroundService
 {
     private readonly WinFspRamAdapter _adapter;
+    private readonly RamFileSystem _fs;
     private readonly RamDriveOptions _options;
     private readonly IHostApplicationLifetime _lifetime;
     private readonly ILogger<WinFspHostedService> _logger;
@@ -20,11 +22,13 @@ internal sealed class WinFspHostedService : BackgroundService
 
     public WinFspHostedService(
         WinFspRamAdapter adapter,
+        RamFileSystem fs,
         IOptions<RamDriveOptions> options,
         IHostApplicationLifetime lifetime,
         ILogger<WinFspHostedService> logger)
     {
         _adapter = adapter;
+        _fs = fs;
         _options = options.Value;
         _lifetime = lifetime;
         _logger = logger;
@@ -81,6 +85,9 @@ internal sealed class WinFspHostedService : BackgroundService
                 _logger.LogInformation("Drive mounted at {MountPoint} via DefineDosDevice.", _options.MountPoint);
             }
 
+            if (_options.CreateTempDirectory)
+                CreateTempDirectoryOnDrive();
+
             await Task.Delay(Timeout.Infinite, stoppingToken);
         }
         catch (DllNotFoundException)
@@ -117,6 +124,15 @@ internal sealed class WinFspHostedService : BackgroundService
         }
 
         _logger.LogInformation("Drive unmounted");
+    }
+
+    private void CreateTempDirectoryOnDrive()
+    {
+        var node = _fs.CreateDirectory(@"\Temp");
+        if (node != null)
+            _logger.LogInformation("Created Temp directory on RAM disk");
+        else
+            _logger.LogWarning("Failed to create Temp directory on RAM disk (already exists or root missing)");
     }
 
     /// <summary>
