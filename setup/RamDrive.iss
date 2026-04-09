@@ -11,8 +11,8 @@
 ; Path to AOT publish output (relative to this .iss file)
 #define PublishDir     "..\publish-aot"
 
-; WinFsp MSI filename â€” place the .msi in the setup\ folder before compiling
-; Download from https://winfsp.dev/rel/  (e.g. winfsp-2.1.24352.msi)
+; WinFsp MSI filename - place the .msi in the setup\ folder before compiling
+; Download from https://winfsp.dev/rel/
 #define WinFspMsi      "winfsp-2.1.25156.msi"
 
 [Setup]
@@ -62,9 +62,31 @@ Source: "{#WinFspMsi}"; DestDir: "{tmp}"; Flags: deleteafterinstall; Components:
 [Icons]
 Name: "{group}\{#MyAppName}";         Filename: "{app}\{#MyAppExeName}"
 Name: "{autodesktop}\{#MyAppName}";   Filename: "{app}\{#MyAppExeName}"; Tasks: desktopicon
+Name: "{group}\Edit Configuration";   Filename: "notepad.exe"; Parameters: """{app}\appsettings.jsonc"""
+Name: "{group}\Restart Service";      Filename: "cmd.exe"; Parameters: "/c sc.exe stop RamDrive & timeout /t 2 & sc.exe start RamDrive & pause"; Components: service
 Name: "{group}\Uninstall {#MyAppName}"; Filename: "{uninstallexe}"
 
 [Code]
+var
+  ConfigPage: TInputQueryWizardPage;
+
+procedure InitializeWizard;
+begin
+  ConfigPage := CreateInputQueryPage(wpSelectTasks,
+    'RamDrive Configuration',
+    'Configure the RAM disk settings.',
+    'Choose a drive letter and capacity. To change these later:' + #13#10 +
+    '1. Edit appsettings.jsonc (Start Menu > RamDrive > Edit Configuration)' + #13#10 +
+    '2. Restart the service: run "sc.exe stop RamDrive && sc.exe start RamDrive"' + #13#10 +
+    '   or use Start Menu > RamDrive > Restart Service');
+
+  ConfigPage.Add('Drive letter (e.g. R):', False);
+  ConfigPage.Add('Capacity in MB (e.g. 2048 = 2 GB):', False);
+
+  ConfigPage.Values[0] := 'R';
+  ConfigPage.Values[1] := '2048';
+end;
+
 function IsWinFspInstalled: Boolean;
 var
   InstallDir: String;
@@ -78,6 +100,37 @@ var
 begin
   Result := Exec('sc.exe', 'query RamDrive', '', SW_HIDE, ewWaitUntilTerminated, ResultCode)
             and (ResultCode = 0);
+end;
+
+function NextButtonClick(CurPageID: Integer): Boolean;
+var
+  Letter: String;
+  Cap: String;
+  CapVal: Integer;
+begin
+  Result := True;
+  if CurPageID = ConfigPage.ID then
+  begin
+    Letter := Trim(ConfigPage.Values[0]);
+    Cap := Trim(ConfigPage.Values[1]);
+
+    // Validate drive letter
+    if (Length(Letter) <> 1) or ((Letter[1] < 'A') or (Letter[1] > 'Z')) and ((Letter[1] < 'a') or (Letter[1] > 'z')) then
+    begin
+      MsgBox('Please enter a single drive letter (A-Z).', mbError, MB_OK);
+      Result := False;
+      Exit;
+    end;
+
+    // Validate capacity
+    CapVal := StrToIntDef(Cap, 0);
+    if CapVal < 16 then
+    begin
+      MsgBox('Capacity must be at least 16 MB.', mbError, MB_OK);
+      Result := False;
+      Exit;
+    end;
+  end;
 end;
 
 procedure StopAndDeleteService;
@@ -109,6 +162,40 @@ begin
   RegWriteDWordValue(HKLM,
        'SOFTWARE\WOW6432Node\WinFsp',
        'MountUseMountmgrFromFSD', 1);
+end;
+
+procedure WriteAppSettings;
+var
+  ConfigPath: String;
+  Letter: String;
+  Cap: String;
+  Lines: TArrayOfString;
+begin
+  Letter := UpperCase(Trim(ConfigPage.Values[0]));
+  Cap := Trim(ConfigPage.Values[1]);
+  ConfigPath := ExpandConstant('{app}\appsettings.jsonc');
+
+  SetArrayLength(Lines, 20);
+  Lines[0]  := '{';
+  Lines[1]  := '  "Logging": {';
+  Lines[2]  := '    "LogLevel": {';
+  Lines[3]  := '      "Default": "Information",';
+  Lines[4]  := '      "Microsoft": "Warning"';
+  Lines[5]  := '    }';
+  Lines[6]  := '  },';
+  Lines[7]  := '';
+  Lines[8]  := '  "RamDrive": {';
+  Lines[9]  := '    "MountPoint": "' + Letter + ':\\",';
+  Lines[10] := '    "CapacityMb": ' + Cap + ',';
+  Lines[11] := '    "PageSizeKb": 64,';
+  Lines[12] := '    "PreAllocate": false,';
+  Lines[13] := '    "VolumeLabel": "RamDrive",';
+  Lines[14] := '    "EnableKernelCache": true';
+  Lines[15] := '  }';
+  Lines[16] := '}';
+  Lines[17] := '';
+
+  SaveStringsToUTF8File(ConfigPath, Lines, False);
 end;
 
 procedure CreateService;
@@ -154,6 +241,9 @@ begin
 
     // Enable Mount Manager so non-admin mounts are visible to all apps
     ConfigureWinFspMountManager;
+
+    // Write appsettings.jsonc with user-chosen drive letter and capacity
+    WriteAppSettings;
 
     // Stop existing service before re-registering
     if IsServiceInstalled then
