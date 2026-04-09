@@ -200,30 +200,30 @@ end;
 
 procedure CreateService;
 var
-  ResultCode: Integer;
   ExePath: String;
+  SvcKey: String;
+  ResultCode: Integer;
 begin
   ExePath := ExpandConstant('{app}\{#MyAppExeName}');
+  SvcKey := 'SYSTEM\CurrentControlSet\Services\RamDrive';
 
-  // Create auto-start service
-  Exec('sc.exe',
-       'create RamDrive binPath= "' + ExePath + '" start= auto DisplayName= "RamDrive RAM Disk"',
-       '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
-
-  // Set description
-  Exec('sc.exe',
-       'description RamDrive "High-performance RAM disk using WinFsp. Provides a virtual drive backed entirely by system memory."',
-       '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
-
-  // Failure recovery: restart after 5s, 10s, 30s
-  Exec('sc.exe',
-       'failure RamDrive reset= 60 actions= restart/5000/restart/10000/restart/30000',
-       '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  // Create service directly via registry (avoids sc.exe quoting issues with spaces in path)
+  RegWriteDWordValue(HKLM, SvcKey, 'Type', 16);           // WIN32_OWN_PROCESS
+  RegWriteDWordValue(HKLM, SvcKey, 'Start', 2);           // AUTO_START
+  RegWriteDWordValue(HKLM, SvcKey, 'ErrorControl', 1);    // NORMAL
+  RegWriteExpandStringValue(HKLM, SvcKey, 'ImagePath', '"' + ExePath + '"');
+  RegWriteStringValue(HKLM, SvcKey, 'ObjectName', 'LocalSystem');
+  RegWriteStringValue(HKLM, SvcKey, 'DisplayName', 'RamDrive RAM Disk');
+  RegWriteStringValue(HKLM, SvcKey, 'Description',
+       'High-performance RAM disk using WinFsp. Provides a virtual drive backed entirely by system memory.');
 
   // Start in early service group (before most user-mode services)
-  RegWriteStringValue(HKLM,
-       'SYSTEM\CurrentControlSet\Services\RamDrive',
-       'Group', 'FSFilter Activity Monitor');
+  RegWriteStringValue(HKLM, SvcKey, 'Group', 'FSFilter Activity Monitor');
+
+  // Failure recovery: restart after 5s, 10s, 30s
+  // FailureActions is a binary blob, using sc.exe for this specific setting
+  Exec('sc.exe', 'failure RamDrive reset= 60 actions= restart/5000/restart/10000/restart/30000',
+       '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
 end;
 
 function InitializeSetup: Boolean;
