@@ -70,11 +70,37 @@ jobs:
             "-p:Version=${{ steps.version.outputs.VERSION }}" `
             -o ./publish-aot
 
+      - name: Download WinFsp MSI
+        shell: pwsh
+        run: |
+          Invoke-WebRequest `
+            -Uri "https://github.com/winfsp/winfsp/releases/download/v2.1/winfsp-2.1.25156.msi" `
+            -OutFile "setup/winfsp-2.1.25156.msi"
+
+      - name: Install Inno Setup
+        shell: pwsh
+        run: |
+          choco install innosetup -y --no-progress
+          Write-Output "C:\Program Files (x86)\Inno Setup 6" >> $env:GITHUB_PATH
+
+      - name: Update version in Inno Setup script
+        shell: pwsh
+        run: |
+          $version = "${{ steps.version.outputs.VERSION }}"
+          (Get-Content setup/RamDrive.iss) -replace '#define MyAppVersion\s+".*"', "#define MyAppVersion   `"$version`"" |
+            Set-Content setup/RamDrive.iss
+
+      - name: Build Inno Setup installer
+        shell: pwsh
+        run: |
+          iscc.exe setup/RamDrive.iss
+          Get-ChildItem installer-output/
+
       - name: Package release archive
         shell: pwsh
         run: |
           $version = "${{ steps.version.outputs.VERSION }}"
-          Compress-Archive -Path publish-aot/RamDrive.exe, publish-aot/appsettings.jsonc, Setup.bat -DestinationPath "RamDrive-$version.zip"
+          Compress-Archive -Path publish-aot/RamDrive.exe, publish-aot/appsettings.jsonc -DestinationPath "RamDrive-$version.zip"
 
       - name: Create GitHub Release
         env:
@@ -83,11 +109,13 @@ jobs:
         run: |
           $version = "${{ steps.version.outputs.VERSION }}"
           $prerelease = "${{ steps.version.outputs.PRERELEASE }}"
+          $installer = Get-ChildItem installer-output/*.exe | Select-Object -First 1
           $ghArgs = @(
             "release", "create", "v$version",
             "--title", "RamDrive $version",
             "--generate-notes",
-            "RamDrive-$version.zip"
+            "RamDrive-$version.zip",
+            $installer.FullName
           )
           if ($prerelease -eq "true") {
             $ghArgs += "--prerelease"

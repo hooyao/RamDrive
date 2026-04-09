@@ -11,6 +11,7 @@ using RamDrive.Core.Memory;
 [assembly: SupportedOSPlatform("windows")]
 
 var builder = Host.CreateDefaultBuilder(args)
+    .UseWindowsService(options => options.ServiceName = "RamDrive")
     .UseContentRoot(AppContext.BaseDirectory)
     .ConfigureAppConfiguration((_, config) =>
     {
@@ -25,6 +26,11 @@ var builder = Host.CreateDefaultBuilder(args)
         {
             options.TimestampFormat = "HH:mm:ss ";
             options.SingleLine = true;
+        });
+        logging.AddEventLog(eventLog =>
+        {
+            eventLog.SourceName = "RamDrive";
+            eventLog.LogName = "Application";
         });
         logging.AddConfiguration(context.Configuration.GetSection("Logging"));
     });

@@ -182,6 +182,7 @@ FodyWeavers.xsd
 appsettings.dev.jsonc
 publish-aot/
 publish-test/
+installer-output/
 dokan-dotnet/
 .claude/
 
