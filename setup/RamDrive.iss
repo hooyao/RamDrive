@@ -135,11 +135,15 @@ end;
 
 procedure StopAndDeleteService;
 var
+  ScExe: String;
   ResultCode: Integer;
 begin
-  Exec('sc.exe', 'stop RamDrive', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  ScExe := ExpandConstant('{sysnative}\sc.exe');
+  if not FileExists(ScExe) then
+    ScExe := ExpandConstant('{sys}\sc.exe');
+  Exec(ScExe, 'stop RamDrive', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
   Sleep(2000);
-  Exec('sc.exe', 'delete RamDrive', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  Exec(ScExe, 'delete RamDrive', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
 end;
 
 procedure InstallWinFsp;
@@ -201,29 +205,41 @@ end;
 procedure CreateService;
 var
   ExePath: String;
+  ScExe: String;
   SvcKey: String;
   ResultCode: Integer;
 begin
   ExePath := ExpandConstant('{app}\{#MyAppExeName}');
   SvcKey := 'SYSTEM\CurrentControlSet\Services\RamDrive';
+  // Use native sc.exe to avoid WOW64 redirection in 32-bit installer
+  ScExe := ExpandConstant('{sysnative}\sc.exe');
+  if not FileExists(ScExe) then
+    ScExe := ExpandConstant('{sys}\sc.exe');
 
-  // Create service directly via registry (avoids sc.exe quoting issues with spaces in path)
-  RegWriteDWordValue(HKLM, SvcKey, 'Type', 16);           // WIN32_OWN_PROCESS
-  RegWriteDWordValue(HKLM, SvcKey, 'Start', 2);           // AUTO_START
-  RegWriteDWordValue(HKLM, SvcKey, 'ErrorControl', 1);    // NORMAL
-  RegWriteExpandStringValue(HKLM, SvcKey, 'ImagePath', '"' + ExePath + '"');
-  RegWriteStringValue(HKLM, SvcKey, 'ObjectName', 'LocalSystem');
-  RegWriteStringValue(HKLM, SvcKey, 'DisplayName', 'RamDrive RAM Disk');
-  RegWriteStringValue(HKLM, SvcKey, 'Description',
-       'High-performance RAM disk using WinFsp. Provides a virtual drive backed entirely by system memory.');
+  // Create service via SCM so it is immediately startable (no reboot needed)
+  if not Exec(ScExe,
+       'create RamDrive binPath= "' + ExePath + '" start= auto DisplayName= "RamDrive RAM Disk"',
+       '', SW_HIDE, ewWaitUntilTerminated, ResultCode) or (ResultCode <> 0) then
+  begin
+    // Fallback: write registry directly (requires reboot for SCM to pick up)
+    RegWriteDWordValue(HKLM, SvcKey, 'Type', 16);
+    RegWriteDWordValue(HKLM, SvcKey, 'Start', 2);
+    RegWriteDWordValue(HKLM, SvcKey, 'ErrorControl', 1);
+    RegWriteExpandStringValue(HKLM, SvcKey, 'ImagePath', '"' + ExePath + '"');
+    RegWriteStringValue(HKLM, SvcKey, 'ObjectName', 'LocalSystem');
+    RegWriteStringValue(HKLM, SvcKey, 'DisplayName', 'RamDrive RAM Disk');
+  end;
+
+  // Description
+  Exec(ScExe, 'description RamDrive "High-performance RAM disk using WinFsp."',
+       '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+
+  // Failure recovery: restart after 5s, 10s, 30s
+  Exec(ScExe, 'failure RamDrive reset= 60 actions= restart/5000/restart/10000/restart/30000',
+       '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
 
   // Start in early service group (before most user-mode services)
   RegWriteStringValue(HKLM, SvcKey, 'Group', 'FSFilter Activity Monitor');
-
-  // Failure recovery: restart after 5s, 10s, 30s
-  // FailureActions is a binary blob, using sc.exe for this specific setting
-  Exec('sc.exe', 'failure RamDrive reset= 60 actions= restart/5000/restart/10000/restart/30000',
-       '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
 end;
 
 function InitializeSetup: Boolean;
@@ -267,7 +283,7 @@ end;
 
 [Run]
 ; Optionally start the service right after install
-Filename: "sc.exe"; Parameters: "start RamDrive"; \
+Filename: "{sysnative}\sc.exe"; Parameters: "start RamDrive"; \
   StatusMsg: "Starting RamDrive service..."; \
   Flags: runhidden nowait; Components: service
 
