@@ -13,6 +13,7 @@ public sealed class PagedFileContent : IDisposable
     private readonly int _pageSize;
     private nint[] _pages;      // index → native page pointer; nint.Zero = not allocated
     private long _length;       // logical file size in bytes
+    private int _reservedPages; // pages reserved in pool but not yet allocated
     private readonly ReaderWriterLockSlim _lock = new(LockRecursionPolicy.NoRecursion);
     private bool _disposed;
 
@@ -106,22 +107,39 @@ public sealed class PagedFileContent : IDisposable
         }
 
         // --- Phase 2: batch-allocate pages outside any lock ---
+        // Unreserve own reservations first so AllocateNewPageIfUnderCapacity
+        // can use that capacity. Verified correct by TLA+ model (tla/PagePoolFixed.tla).
         nint[]? preAllocated = null;
         int preAllocatedCount = 0;
+        int unreservedForAlloc = 0;
         if (neededCount > 0)
         {
+            int currentReserved = Volatile.Read(ref _reservedPages);
+            if (currentReserved > 0)
+            {
+                unreservedForAlloc = Math.Min(currentReserved, neededCount);
+                _pool.Unreserve(unreservedForAlloc);
+                Interlocked.Add(ref _reservedPages, -unreservedForAlloc);
+            }
+
             preAllocated = new nint[neededCount];
             preAllocatedCount = _pool.RentBatch(preAllocated, neededCount);
             if (preAllocatedCount < neededCount)
             {
-                // Not enough capacity — return what we got and fail
+                // Not enough capacity — return what we got, restore reservations, and fail
                 if (preAllocatedCount > 0)
                     _pool.ReturnBatch(preAllocated, preAllocatedCount);
+                if (unreservedForAlloc > 0)
+                {
+                    _pool.Reserve(unreservedForAlloc);
+                    Interlocked.Add(ref _reservedPages, unreservedForAlloc);
+                }
                 return -1;
             }
         }
 
         // --- Phase 3: write lock — only page table + memcpy, no OS allocations ---
+        // Reservations already consumed in Phase 2 via Unreserve.
         _lock.EnterWriteLock();
         try
         {
@@ -148,6 +166,13 @@ public sealed class PagedFileContent : IDisposable
                     {
                         // Race condition: another thread allocated between our read-lock scan
                         // and write-lock acquisition. Fall back to single Rent.
+                        // Unreserve one slot if available so Rent can succeed.
+                        int curReserved = Volatile.Read(ref _reservedPages);
+                        if (curReserved > 0)
+                        {
+                            _pool.Unreserve(1);
+                            Interlocked.Decrement(ref _reservedPages);
+                        }
                         nint page = _pool.Rent();
                         if (page == nint.Zero)
                         {
@@ -183,16 +208,21 @@ public sealed class PagedFileContent : IDisposable
 
     /// <summary>
     /// Set logical file length. Truncation frees pages beyond the new length.
-    /// Extension does not allocate pages (sparse).
-    /// Returns false if extending would exceed capacity (based on max page count).
+    /// Extension reserves capacity in the pool (without allocating pages) to guarantee
+    /// that subsequent writes will succeed — required for kernel cache mode where the
+    /// cache manager calls SetFileSize before issuing writes.
+    /// Returns false if extending would exceed capacity.
     /// </summary>
     public bool SetLength(long newLength)
     {
+        if (newLength < 0) return false;
+
         _lock.EnterWriteLock();
         try
         {
             if (newLength < _length)
             {
+                // --- Truncation ---
                 int newPageCount = (int)((newLength + _pageSize - 1) / _pageSize);
 
                 // Zero partial data in the last retained page
@@ -211,7 +241,7 @@ public sealed class PagedFileContent : IDisposable
                     }
                 }
 
-                // Collect pages to free, then batch-return outside the hot path
+                // Collect pages to free, then batch-return
                 int toFreeCount = 0;
                 for (int i = newPageCount; i < _pages.Length; i++)
                 {
@@ -236,6 +266,35 @@ public sealed class PagedFileContent : IDisposable
 
                 if (newPageCount < _pages.Length)
                     Array.Resize(ref _pages, newPageCount);
+
+                // Release excess reservations
+                int oldRequired = (int)((_length + _pageSize - 1) / _pageSize);
+                int allocatedInRange = 0;
+                for (int i = 0; i < Math.Min(oldRequired, _pages.Length); i++)
+                {
+                    if (_pages[i] != nint.Zero)
+                        allocatedInRange++;
+                }
+                int newReserved = Math.Max(0, newPageCount - allocatedInRange);
+                int reserveDelta = _reservedPages - newReserved;
+                if (reserveDelta > 0)
+                {
+                    _pool.Unreserve(reserveDelta);
+                    _reservedPages = newReserved;
+                }
+            }
+            else if (newLength > _length)
+            {
+                // --- Extension: just set logical size (sparse) ---
+                // Single file cannot exceed total pool capacity.
+                if (newLength > _pool.CapacityBytes)
+                    return false;
+
+                // Expand page table only — pages stay nint.Zero (sparse),
+                // allocated on demand in Write.
+                int newPageCount = (int)((newLength + _pageSize - 1) / _pageSize);
+                if (newPageCount > _pages.Length)
+                    Array.Resize(ref _pages, newPageCount);
             }
 
             _length = newLength;
@@ -255,6 +314,13 @@ public sealed class PagedFileContent : IDisposable
         _lock.EnterWriteLock();
         try
         {
+            // Release any outstanding reservations
+            if (_reservedPages > 0)
+            {
+                _pool.Unreserve(_reservedPages);
+                _reservedPages = 0;
+            }
+
             for (int i = 0; i < _pages.Length; i++)
             {
                 if (_pages[i] != nint.Zero)

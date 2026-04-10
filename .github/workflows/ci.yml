@@ -47,6 +47,16 @@ jobs:
         with:
           dotnet-version: "10.0.x"
 
+      - name: Install WinFsp
+        shell: pwsh
+        run: |
+          choco install winfsp -y --params '/Developer'
+          # Verify WinFsp DLL is available for P/Invoke
+          if (!(Test-Path "C:\Program Files (x86)\WinFsp\bin\winfsp-x64.dll")) {
+            Write-Error "WinFsp installation failed - DLL not found"
+            exit 1
+          }
+
       - name: Restore dependencies
         run: dotnet restore RamDrive.slnx
 
@@ -57,7 +67,8 @@ jobs:
         shell: pwsh
         run: |
           $projects = @(
-            "tests/RamDrive.Core.Tests/RamDrive.Core.Tests.csproj"
+            "tests/RamDrive.Core.Tests/RamDrive.Core.Tests.csproj",
+            "tests/RamDrive.IntegrationTests/RamDrive.IntegrationTests.csproj"
           )
           $failed = $false
           foreach ($proj in $projects) {

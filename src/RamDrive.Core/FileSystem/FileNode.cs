@@ -26,6 +26,9 @@ public sealed class FileNode : IDisposable
     /// <summary>Children (directories only). Case-insensitive on Windows.</summary>
     public Dictionary<string, FileNode>? Children { get; }
 
+    /// <summary>Self-relative security descriptor (binary form). Null = no ACL.</summary>
+    public byte[]? SecurityDescriptor { get; set; }
+
     public FileNode? Parent { get; set; }
 
     public long Size => Content?.Length ?? 0;

@@ -19,6 +19,15 @@ public sealed class RamFileSystem : IDisposable
         _root = FileNode.CreateDirectory(string.Empty);
     }
 
+    /// <summary>
+    /// Set the security descriptor on the root directory.
+    /// Must be called before mounting if ACL support is desired.
+    /// </summary>
+    public void SetRootSecurityDescriptor(byte[] securityDescriptor)
+    {
+        _root.SecurityDescriptor = securityDescriptor;
+    }
+
     public long TotalBytes => _pool.CapacityBytes;
     public long UsedBytes => _pool.UsedBytes;
     public long FreeBytes => _pool.FreeBytes;
@@ -39,7 +48,7 @@ public sealed class RamFileSystem : IDisposable
     /// Create a file at the given path. Parent directory must exist.
     /// Returns the new FileNode, or null if parent not found or name already exists.
     /// </summary>
-    public FileNode? CreateFile(string path)
+    public FileNode? CreateFile(string path, byte[]? securityDescriptor = null)
     {
         lock (_structureLock)
         {
@@ -48,6 +57,7 @@ public sealed class RamFileSystem : IDisposable
             if (parent.Children!.ContainsKey(name)) return null;
 
             var node = FileNode.CreateFile(name, _pool);
+            node.SecurityDescriptor = securityDescriptor;
             node.Parent = parent;
             parent.Children[name] = node;
             parent.LastWriteTime = DateTime.UtcNow;
@@ -59,7 +69,7 @@ public sealed class RamFileSystem : IDisposable
     /// Create a directory at the given path. Parent must exist.
     /// Returns the new FileNode, or null if parent not found or name already exists.
     /// </summary>
-    public FileNode? CreateDirectory(string path)
+    public FileNode? CreateDirectory(string path, byte[]? securityDescriptor = null)
     {
         lock (_structureLock)
         {
@@ -68,6 +78,7 @@ public sealed class RamFileSystem : IDisposable
             if (parent.Children!.ContainsKey(name)) return null;
 
             var node = FileNode.CreateDirectory(name);
+            node.SecurityDescriptor = securityDescriptor;
             node.Parent = parent;
             parent.Children[name] = node;
             parent.LastWriteTime = DateTime.UtcNow;
@@ -140,7 +151,11 @@ public sealed class RamFileSystem : IDisposable
         {
             var node = FindNodeInternal(path);
             if (node == null || !node.IsDirectory) return null;
-            return node.Children!.Values.ToList();
+            // Must be sorted by name (case-insensitive) for WinFsp marker-based
+            // directory enumeration pagination to work correctly.
+            return node.Children!.Values
+                .OrderBy(n => n.Name, StringComparer.OrdinalIgnoreCase)
+                .ToList();
         }
     }
 

@@ -17,15 +17,17 @@ public sealed class PagePool : IDisposable
     private readonly ConcurrentStack<nint> _allPages = new(); // tracks every allocation for cleanup
     private long _allocatedCount; // total pages ever allocated from OS
     private long _rentedCount;    // pages currently in use (not on free stack)
+    private long _reservedCount;  // pages reserved by SetLength but not yet allocated
     private volatile bool _disposed;
 
     public int PageSize => _pageSize;
     public long MaxPages => _maxPages;
     public long AllocatedCount => Volatile.Read(ref _allocatedCount);
     public long RentedCount => Volatile.Read(ref _rentedCount);
+    public long ReservedCount => Volatile.Read(ref _reservedCount);
     public long FreeCount => AllocatedCount - RentedCount;
     public long CapacityBytes => _maxPages * _pageSize;
-    public long UsedBytes => RentedCount * _pageSize;
+    public long UsedBytes => (RentedCount + ReservedCount) * _pageSize;
     public long FreeBytes => CapacityBytes - UsedBytes;
 
     public PagePool(IOptions<RamDriveOptions> options, ILogger<PagePool> logger)
@@ -48,6 +50,40 @@ public sealed class PagePool : IDisposable
             }
             logger.LogInformation("PagePool: pre-allocation complete");
         }
+    }
+
+    /// <summary>
+    /// Reserve capacity for pages without allocating them. Returns true if reservation succeeded.
+    /// Reserved pages count toward capacity limits but consume no memory until actually rented.
+    /// </summary>
+    public bool Reserve(long count)
+    {
+        if (count <= 0) return true;
+        while (true)
+        {
+            long currentReserved = Volatile.Read(ref _reservedCount);
+            long currentAllocated = Volatile.Read(ref _allocatedCount);
+            long currentRented = Volatile.Read(ref _rentedCount);
+            // Free stack pages are already allocated but available — they don't need reservation.
+            // Effective committed = allocated (includes free stack + rented) + reserved (not yet allocated).
+            // Max allowed: _maxPages. So: allocated + reserved + count <= _maxPages.
+            // But rented pages came from either free stack or new allocation. Reservations cover
+            // future allocations beyond what's already allocated.
+            if (currentAllocated + currentReserved + count > _maxPages)
+                return false;
+            if (Interlocked.CompareExchange(ref _reservedCount, currentReserved + count, currentReserved) == currentReserved)
+                return true;
+        }
+    }
+
+    /// <summary>
+    /// Release a previous reservation. Called when reserved pages are no longer needed
+    /// (e.g., file truncated or deleted).
+    /// </summary>
+    public void Unreserve(long count)
+    {
+        if (count <= 0) return;
+        Interlocked.Add(ref _reservedCount, -count);
     }
 
     /// <summary>
@@ -131,15 +167,19 @@ public sealed class PagePool : IDisposable
 
         while (_allPages.TryPop(out nint page))
         {
-            unsafe { NativeMemory.Free((void*)page); }
+            unsafe { NativeMemory.AlignedFree((void*)page); }
         }
     }
 
     private nint AllocateNewPageIfUnderCapacity()
     {
         long current = Volatile.Read(ref _allocatedCount);
-        while (current < _maxPages)
+        while (true)
         {
+            long reserved = Volatile.Read(ref _reservedCount);
+            if (current + reserved >= _maxPages)
+                return nint.Zero; // capacity exhausted (including reservations)
+
             long next = Interlocked.CompareExchange(ref _allocatedCount, current + 1, current);
             if (next == current)
             {
@@ -150,12 +190,12 @@ public sealed class PagePool : IDisposable
             }
             current = next;
         }
-        return nint.Zero; // capacity exhausted
     }
 
     private unsafe nint AllocateNativePage()
     {
-        void* ptr = NativeMemory.AllocZeroed((nuint)_pageSize);
+        void* ptr = NativeMemory.AlignedAlloc((nuint)_pageSize, (nuint)_pageSize);
+        NativeMemory.Clear(ptr, (nuint)_pageSize);
         nint page = (nint)ptr;
         _allPages.Push(page);
         return page;

@@ -5,5 +5,7 @@
   </Folder>
   <Folder Name="/tests/">
     <Project Path="tests/RamDrive.Core.Tests/RamDrive.Core.Tests.csproj" />
+    <Project Path="tests/RamDrive.Benchmarks/RamDrive.Benchmarks.csproj" />
+    <Project Path="tests/RamDrive.IntegrationTests/RamDrive.IntegrationTests.csproj" />
   </Folder>
 </Solution>
