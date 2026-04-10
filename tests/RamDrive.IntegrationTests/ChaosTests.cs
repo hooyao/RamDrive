@@ -91,8 +91,9 @@ public class ChaosTests(RamDriveFixture fx)
         try { Directory.Delete(root, true); } catch { }
 
         Volatile.Read(ref unexpectedErrors).Should().Be(0, "no unexpected errors");
-        // Integrity failures are allowed up to 0.01% of total ops due to kernel cache stale reads
-        // (FileInfoTimeout=MAX means infinite cache; concurrent overwrite+read can see stale data)
+        // WinFsp FileInfoTimeout=MAX causes stale file-size metadata under high concurrency:
+        // ReadAllBytes may see a stale size from WinFsp's metadata cache while the actual data
+        // is correct. Confirmed: 0 failures with kernel cache disabled. Allow up to 0.01%.
         long maxAllowed = Math.Max(totalOps / 10000, 10);
         Volatile.Read(ref integrityFails).Should().BeLessThanOrEqualTo(maxAllowed,
             $"integrity failures should be < 0.01% of ops (allowed: {maxAllowed})");
@@ -116,11 +117,11 @@ public class ChaosTests(RamDriveFixture fx)
             {
                 var fi = w.PickFile(rng); if (fi == null) goto case Op.CreateFile;
                 int len = rng.Next(1, 64 * 1024); var data = new byte[len]; rng.NextBytes(data);
+                fi.Mutated(0); // invalidate BEFORE modifying file — prevents stale hash in concurrent ReadVerify
                 using (var fs = new FileStream(fi.Path, FileMode.Open, FileAccess.ReadWrite, FileShare.ReadWrite))
                 {
                     long off = rng.NextInt64(0, Math.Max(fs.Length, 1));
                     fs.Seek(off, SeekOrigin.Begin); fs.Write(data);
-                    fi.Mutated(fs.Length);
                 }
                 break;
             }
@@ -128,8 +129,9 @@ public class ChaosTests(RamDriveFixture fx)
             {
                 var fi = w.PickFile(rng); if (fi == null) goto case Op.CreateFile;
                 int len = rng.Next(1, 32 * 1024); var data = new byte[len]; rng.NextBytes(data);
+                fi.Mutated(0); // invalidate BEFORE modifying file
                 using (var fs = new FileStream(fi.Path, FileMode.Append, FileAccess.Write, FileShare.ReadWrite))
-                { fs.Write(data); fi.Mutated(fs.Length); }
+                    fs.Write(data);
                 break;
             }
             case Op.ReadVerify:
@@ -145,10 +147,11 @@ public class ChaosTests(RamDriveFixture fx)
             case Op.Truncate:
             {
                 var fi = w.PickFile(rng); if (fi == null) break;
+                fi.Mutated(0); // invalidate BEFORE modifying file
                 try
                 {
                     using var fs = new FileStream(fi.Path, FileMode.Open, FileAccess.ReadWrite, FileShare.ReadWrite);
-                    if (fs.Length > 0) { long nl = rng.NextInt64(0, fs.Length); fs.SetLength(nl); fi.Mutated(nl); }
+                    if (fs.Length > 0) { long nl = rng.NextInt64(0, fs.Length); fs.SetLength(nl); }
                 }
                 catch (FileNotFoundException) { }
                 break;
@@ -156,10 +159,11 @@ public class ChaosTests(RamDriveFixture fx)
             case Op.Extend:
             {
                 var fi = w.PickFile(rng); if (fi == null) break;
+                fi.Mutated(0); // invalidate BEFORE modifying file
                 try
                 {
                     using var fs = new FileStream(fi.Path, FileMode.Open, FileAccess.ReadWrite, FileShare.ReadWrite);
-                    long nl = fs.Length + rng.Next(1, 128 * 1024); fs.SetLength(nl); fi.Mutated(nl);
+                    long nl = fs.Length + rng.Next(1, 128 * 1024); fs.SetLength(nl);
                 }
                 catch (FileNotFoundException) { }
                 break;
@@ -168,9 +172,9 @@ public class ChaosTests(RamDriveFixture fx)
             {
                 var fi = w.PickFile(rng); if (fi == null) goto case Op.CreateFile;
                 int sz = rng.Next(0, 256 * 1024); var data = new byte[sz]; rng.NextBytes(data);
-                fi.Mutated(0); // invalidate before write — ReadVerify will see generation change
+                long gen = fi.Mutated(0); // invalidate before write — ReadVerify will see generation change
                 File.WriteAllBytes(fi.Path, data);
-                fi.SetKnown(data);
+                fi.SetKnown(data, gen); // only set hash if no concurrent mutation
                 break;
             }
             case Op.Delete:
@@ -241,8 +245,16 @@ public class ChaosTests(RamDriveFixture fx)
         public TrackedFile(string path, byte[] data)
         { Path = path; Size = data.Length; Hash = SHA256.HashData(data); Generation = 0; }
 
-        public void Mutated(long newSize) { lock (_lk) { Size = newSize; Hash = null; Generation++; } }
-        public void SetKnown(byte[] data) { lock (_lk) { Size = data.Length; Hash = SHA256.HashData(data); /* same generation as preceding Mutated — deliberate */ } }
+        public long Mutated(long newSize) { lock (_lk) { Size = newSize; Hash = null; return ++Generation; } }
+        public void SetKnown(byte[] data, long expectedGen)
+        {
+            lock (_lk)
+            {
+                // Only update hash if no concurrent mutation happened since our Mutated() call
+                if (Generation != expectedGen) return;
+                Size = data.Length; Hash = SHA256.HashData(data);
+            }
+        }
 
         /// <summary>
         /// Snapshot generation + hash before reading. After read, call VerifySnapshot.
@@ -297,6 +309,7 @@ public class ChaosTests(RamDriveFixture fx)
         public void Renamed(TrackedFile fi, string np)
         {
             _files.TryRemove(fi.Path, out _);
+            fi.Mutated(0); // invalidate hash — prevents stale-path race with concurrent Overwrite
             lock (fi) { fi.Path = np; }
             _files[np] = fi;
         }

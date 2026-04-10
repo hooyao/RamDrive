@@ -98,14 +98,14 @@ public unsafe class OnReadWriteBenchmark
             var node = _fs.FindNode(fileName);
             if (node == null) { fileAttributes = 0; return NtStatus.ObjectNameNotFound; }
             fileAttributes = (uint)node.Attributes;
-            securityDescriptor = null;
+            securityDescriptor = node.SecurityDescriptor;
             return NtStatus.Success;
         }
 
         public ValueTask<CreateResult> CreateFile(string fileName, uint co, uint ga, uint fa, byte[]? sd, ulong alloc,
             FileOperationInfo info, CancellationToken ct)
         {
-            var file = _fs.CreateFile(fileName);
+            var file = _fs.CreateFile(fileName, sd);
             if (file == null) return new(CreateResult.Error(NtStatus.ObjectPathNotFound));
             if (alloc > 0) file.Content!.SetLength((long)alloc);
             info.Context = file;

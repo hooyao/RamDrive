@@ -1,5 +1,6 @@
 using System.Runtime.CompilerServices;
 using System.Runtime.Versioning;
+using System.Security.AccessControl;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using RamDrive.Core.Configuration;
@@ -19,6 +20,12 @@ namespace RamDrive.Cli;
 [SupportedOSPlatform("windows")]
 internal sealed unsafe class WinFspRamAdapter : IFileSystem
 {
+    /// <summary>
+    /// Default root security descriptor (same as WinFsp memfs):
+    /// Owner=Administrators, Group=Administrators, DACL grants full access to SYSTEM, Administrators, Everyone.
+    /// </summary>
+    private const string RootSddl = "O:BAG:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;WD)";
+
     private readonly RamFileSystem _fs;
     private readonly RamDriveOptions _options;
     private readonly ILogger<WinFspRamAdapter> _logger;
@@ -28,6 +35,12 @@ internal sealed unsafe class WinFspRamAdapter : IFileSystem
         _fs = fs;
         _options = options.Value;
         _logger = logger;
+
+        // Set root directory security descriptor so WinFsp enforces ACLs
+        var sd = new RawSecurityDescriptor(RootSddl);
+        var bytes = new byte[sd.BinaryLength];
+        sd.GetBinaryForm(bytes, 0);
+        _fs.SetRootSecurityDescriptor(bytes);
     }
 
     // ═══════════════════════════════════════════
@@ -92,7 +105,7 @@ internal sealed unsafe class WinFspRamAdapter : IFileSystem
         }
 
         fileAttributes = (uint)node.Attributes;
-        securityDescriptor = null; // no ACL — WinFsp skips access check when sdSize=0
+        securityDescriptor = node.SecurityDescriptor;
         return NtStatus.Success;
     }
 
@@ -109,7 +122,7 @@ internal sealed unsafe class WinFspRamAdapter : IFileSystem
 
         if (isDir)
         {
-            var dir = _fs.CreateDirectory(fileName);
+            var dir = _fs.CreateDirectory(fileName, securityDescriptor);
             if (dir == null)
                 return V(CreateResult.Error(NtStatus.ObjectNameCollision));
 
@@ -118,7 +131,7 @@ internal sealed unsafe class WinFspRamAdapter : IFileSystem
             return V(new CreateResult(NtStatus.Success, MakeFileInfo(dir)));
         }
 
-        var file = _fs.CreateFile(fileName);
+        var file = _fs.CreateFile(fileName, securityDescriptor);
         if (file == null)
         {
             // Distinguish: parent not found vs name collision
@@ -272,8 +285,12 @@ internal sealed unsafe class WinFspRamAdapter : IFileSystem
 
         if (setAllocationSize)
         {
-            // AllocationSize is a pre-reservation hint. Do not change logical file size.
-            // For RAM disk, we don't pre-allocate pages — sparse allocation on write is sufficient.
+            // SetAllocationSize is called before writes (e.g., during file copy).
+            // Check if the requested allocation fits — this lets the OS report DISK_FULL
+            // before starting the copy. No pages are reserved; actual allocation happens on Write.
+            long additional = (long)newSize - node.Size;
+            if (additional > 0 && additional > _fs.FreeBytes)
+                return V(FsResult.Error(NtStatus.DiskFull));
             return V(FsResult.Success(MakeFileInfo(node)));
         }
 
@@ -282,6 +299,43 @@ internal sealed unsafe class WinFspRamAdapter : IFileSystem
 
         node.LastWriteTime = DateTime.UtcNow;
         return V(FsResult.Success(MakeFileInfo(node)));
+    }
+
+    // ═══════════════════════════════════════════
+    //  Security
+    // ═══════════════════════════════════════════
+
+    public int GetFileSecurity(string fileName, ref byte[]? securityDescriptor, FileOperationInfo info)
+    {
+        var node = Node(info);
+        if (node == null)
+            return NtStatus.ObjectNameNotFound;
+
+        securityDescriptor = node.SecurityDescriptor;
+        return NtStatus.Success;
+    }
+
+    public int SetFileSecurity(string fileName, uint securityInformation, byte[] modificationDescriptor, FileOperationInfo info)
+    {
+        var node = Node(info);
+        if (node == null)
+            return NtStatus.ObjectNameNotFound;
+
+        var existing = node.SecurityDescriptor != null
+            ? new RawSecurityDescriptor(node.SecurityDescriptor, 0)
+            : new RawSecurityDescriptor(RootSddl);
+        var modification = new RawSecurityDescriptor(modificationDescriptor, 0);
+
+        // Merge based on SECURITY_INFORMATION flags
+        if ((securityInformation & 1) != 0) existing.Owner = modification.Owner;       // OWNER_SECURITY_INFORMATION
+        if ((securityInformation & 2) != 0) existing.Group = modification.Group;       // GROUP_SECURITY_INFORMATION
+        if ((securityInformation & 4) != 0) existing.DiscretionaryAcl = modification.DiscretionaryAcl; // DACL_SECURITY_INFORMATION
+        if ((securityInformation & 8) != 0) existing.SystemAcl = modification.SystemAcl;               // SACL_SECURITY_INFORMATION
+
+        var result = new byte[existing.BinaryLength];
+        existing.GetBinaryForm(result, 0);
+        node.SecurityDescriptor = result;
+        return NtStatus.Success;
     }
 
     // ═══════════════════════════════════════════

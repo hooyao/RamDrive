@@ -285,19 +285,14 @@ public sealed class PagedFileContent : IDisposable
             }
             else if (newLength > _length)
             {
-                // --- Extension: reserve capacity without allocating ---
-                int oldPageCount = (int)((_length + _pageSize - 1) / _pageSize);
+                // --- Extension: just set logical size (sparse) ---
+                // Single file cannot exceed total pool capacity.
+                if (newLength > _pool.CapacityBytes)
+                    return false;
+
+                // Expand page table only — pages stay nint.Zero (sparse),
+                // allocated on demand in Write.
                 int newPageCount = (int)((newLength + _pageSize - 1) / _pageSize);
-                int additionalPages = newPageCount - oldPageCount;
-
-                if (additionalPages > 0)
-                {
-                    if (!_pool.Reserve(additionalPages))
-                        return false;
-                    _reservedPages += additionalPages;
-                }
-
-                // Expand page table (entries stay nint.Zero — sparse)
                 if (newPageCount > _pages.Length)
                     Array.Resize(ref _pages, newPageCount);
             }

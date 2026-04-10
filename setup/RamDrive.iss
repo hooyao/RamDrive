@@ -297,7 +297,7 @@ begin
   Lines[11] := '    "PageSizeKb": 64,';
   Lines[12] := '    "PreAllocate": false,';
   Lines[13] := '    "VolumeLabel": "RamDrive",';
-  Lines[14] := '    "EnableKernelCache": true,';
+  Lines[14] := '    "EnableKernelCache": false,';
   Lines[15] := '    "CreateTempDirectory": ' + CreateTemp;
   Lines[16] := '  }';
   Lines[17] := '}';

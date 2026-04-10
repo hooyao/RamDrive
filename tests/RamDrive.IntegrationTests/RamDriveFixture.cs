@@ -1,5 +1,6 @@
 using System.Runtime.CompilerServices;
 using System.Runtime.Versioning;
+using System.Security.AccessControl;
 using Microsoft.Extensions.Logging.Abstractions;
 using Microsoft.Extensions.Options;
 using RamDrive.Core.Configuration;
@@ -29,7 +30,7 @@ public sealed class RamDriveFixture : IDisposable
         {
             CapacityMb = CapacityMb,
             PageSizeKb = 64,
-            EnableKernelCache = true,
+            EnableKernelCache = false,
             VolumeLabel = "IntegrationTest",
         };
 
@@ -75,8 +76,16 @@ internal sealed unsafe class TestAdapter : IFileSystem
     private readonly RamFileSystem _fs;
     private readonly RamDriveOptions _options;
 
+    private const string RootSddl = "O:BAG:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;WD)";
+
     public TestAdapter(RamFileSystem fs, RamDriveOptions options)
-    { _fs = fs; _options = options; }
+    {
+        _fs = fs; _options = options;
+        var sd = new RawSecurityDescriptor(RootSddl);
+        var bytes = new byte[sd.BinaryLength];
+        sd.GetBinaryForm(bytes, 0);
+        _fs.SetRootSecurityDescriptor(bytes);
+    }
 
     public bool SynchronousIo => true;
 
@@ -105,7 +114,7 @@ internal sealed unsafe class TestAdapter : IFileSystem
     {
         var node = _fs.FindNode(fileName);
         if (node == null) { fileAttributes = 0; return NtStatus.ObjectNameNotFound; }
-        fileAttributes = (uint)node.Attributes; securityDescriptor = null;
+        fileAttributes = (uint)node.Attributes; securityDescriptor = node.SecurityDescriptor;
         return NtStatus.Success;
     }
 
@@ -115,12 +124,12 @@ internal sealed unsafe class TestAdapter : IFileSystem
         bool isDir = (co & (uint)CreateOptions.FileDirectoryFile) != 0;
         if (isDir)
         {
-            var dir = _fs.CreateDirectory(fileName);
+            var dir = _fs.CreateDirectory(fileName, sd);
             if (dir == null) return new(CreateResult.Error(NtStatus.ObjectNameCollision));
             info.Context = dir; info.IsDirectory = true;
             return new(new CreateResult(NtStatus.Success, MkInfo(dir)));
         }
-        var file = _fs.CreateFile(fileName);
+        var file = _fs.CreateFile(fileName, sd);
         if (file == null)
         {
             if (_fs.FindNode(fileName) != null) return new(CreateResult.Error(NtStatus.ObjectNameCollision));
@@ -197,10 +206,35 @@ internal sealed unsafe class TestAdapter : IFileSystem
         FileOperationInfo info, CancellationToken ct)
     {
         var n = N(info); if (n?.Content == null) return new(FsResult.Error(NtStatus.ObjectNameNotFound));
-        if (alloc) return new(FsResult.Success(MkInfo(n)));
+        if (alloc)
+        {
+            long additional = (long)sz - n.Size;
+            if (additional > 0 && additional > _fs.FreeBytes)
+                return new(FsResult.Error(NtStatus.DiskFull));
+            return new(FsResult.Success(MkInfo(n)));
+        }
         if (!n.Content.SetLength((long)sz)) return new(FsResult.Error(NtStatus.DiskFull));
         n.LastWriteTime = DateTime.UtcNow;
         return new(FsResult.Success(MkInfo(n)));
+    }
+
+    public int GetFileSecurity(string fileName, ref byte[]? securityDescriptor, FileOperationInfo info)
+    {
+        var n = N(info); if (n == null) return NtStatus.ObjectNameNotFound;
+        securityDescriptor = n.SecurityDescriptor; return NtStatus.Success;
+    }
+
+    public int SetFileSecurity(string fileName, uint securityInformation, byte[] modificationDescriptor, FileOperationInfo info)
+    {
+        var n = N(info); if (n == null) return NtStatus.ObjectNameNotFound;
+        var existing = n.SecurityDescriptor != null ? new RawSecurityDescriptor(n.SecurityDescriptor, 0) : new RawSecurityDescriptor(RootSddl);
+        var modification = new RawSecurityDescriptor(modificationDescriptor, 0);
+        if ((securityInformation & 1) != 0) existing.Owner = modification.Owner;
+        if ((securityInformation & 2) != 0) existing.Group = modification.Group;
+        if ((securityInformation & 4) != 0) existing.DiscretionaryAcl = modification.DiscretionaryAcl;
+        if ((securityInformation & 8) != 0) existing.SystemAcl = modification.SystemAcl;
+        var result = new byte[existing.BinaryLength]; existing.GetBinaryForm(result, 0);
+        n.SecurityDescriptor = result; return NtStatus.Success;
     }
 
     public ValueTask<int> CanDelete(string fileName, FileOperationInfo info, CancellationToken ct)
