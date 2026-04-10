@@ -151,7 +151,11 @@ public sealed class RamFileSystem : IDisposable
         {
             var node = FindNodeInternal(path);
             if (node == null || !node.IsDirectory) return null;
-            return node.Children!.Values.ToList();
+            // Must be sorted by name (case-insensitive) for WinFsp marker-based
+            // directory enumeration pagination to work correctly.
+            return node.Children!.Values
+                .OrderBy(n => n.Name, StringComparer.OrdinalIgnoreCase)
+                .ToList();
         }
     }
 

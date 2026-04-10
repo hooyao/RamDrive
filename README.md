@@ -40,16 +40,17 @@ PagePool (NativeMemory + ConcurrentStack<nint>)
 
 ## Quick Start
 
-1. Download the latest release from [Releases](https://github.com/hooyao/RamDrive/releases) and unzip
-2. **Right-click `Setup.bat` → Run as administrator** (one-time setup: installs WinFsp and configures the system)
-3. Double-click `RamDrive.exe` — no admin required from now on
-4. Press `Ctrl+C` to unmount
+**Option A: Installer (recommended)**
 
-### What does Setup.bat do?
+1. Download `RamDrive-X.Y.Z-setup.exe` from [Releases](https://github.com/hooyao/RamDrive/releases)
+2. Run the installer — it bundles WinFsp, configures the drive letter and capacity, and registers a Windows Service
+3. The RAM disk starts automatically on boot
 
-- Installs [WinFsp](https://winfsp.dev/) if not already present (silent install, no reboot)
-- Configures WinFsp to use kernel-mode Mount Manager (so the drive is visible to all apps including ATTO, CrystalDiskMark, etc.)
-- Only needs to be run once — after that, `RamDrive.exe` works without admin
+**Option B: Portable**
+
+1. Download the `.zip` from [Releases](https://github.com/hooyao/RamDrive/releases) and extract
+2. Install [WinFsp](https://winfsp.dev/rel/) 2.x manually
+3. Run `RamDrive.exe` — press `Ctrl+C` to unmount
 
 ### Configuration
 
@@ -58,15 +59,43 @@ Edit `appsettings.jsonc` or override via command line (`--RamDrive:CapacityMb=40
 ```jsonc
 {
   "RamDrive": {
-    "MountPoint": "R:\\",         // Drive letter
-    "CapacityMb": 2048,           // Total capacity in MB
-    "PageSizeKb": 64,             // Page size (64 KB default, try 256 for large files)
-    "PreAllocate": false,         // true = allocate all memory at startup
-    "VolumeLabel": "RamDrive",    // Volume label in Explorer
-    "EnableKernelCache": true     // Windows kernel page cache (~3x read throughput)
+    "MountPoint": "R:\\",           // Drive letter
+    "CapacityMb": 2048,             // Total capacity in MB
+    "PageSizeKb": 64,               // Page size (64 KB default, try 256 for large files)
+    "PreAllocate": false,           // true = allocate all memory at startup
+    "VolumeLabel": "RamDrive",      // Volume label in Explorer
+    "EnableKernelCache": false,     // Kernel page cache (~3x throughput, see docs)
+    "CreateTempDirectory": false    // Create a Temp dir on mount
   }
 }
 ```
+
+## Formal Verification
+
+The core concurrency protocol is formally verified with [TLA+](https://lamport.azurewebsted.net/tla/tla.html) and the TLC model checker.
+
+**What's verified (`tla/RamDiskSystem.tla`):**
+
+| Property | Meaning |
+|----------|---------|
+| PoolConsistent | Pool accounting: `rented <= allocated <= maxPages` |
+| NoPageLeak | Every rented page is accounted for (in a file or in-transit) |
+| FreeBytesAccurate | `FreeBytes = Capacity - RentedPages` — never polluted by intermediate state |
+| DataIntegrity | No file ever contains another file's data |
+| ReadConsistent | Reads always return data belonging to the file being read |
+| DeadFilesClean | Deleted files hold no pages |
+| WriteTerminates | Every write eventually completes or fails (liveness) |
+
+**Verified configurations:**
+
+| Config | Pages | Files | Distinct States | Result |
+|--------|-------|-------|----------------|--------|
+| Minimal | 3 | 2 | 3,163,692 | All pass |
+| Standard | 4 | 2 | 66,190,728 | All pass |
+
+The model covers: 3-phase write (scan/rent/assign), concurrent reads, sparse extend, truncate, delete, file creation, `SetAllocationSize` TOCTOU check, and `GetVolumeInfo` as an external observer.
+
+**Historical context:** An earlier narrow model (`PagePoolFixed.tla`) only verified the PagePool reserve/rent protocol. It missed a system-level bug where `Reserve()` in `SetLength` polluted `FreeBytes`, causing stale metadata under high concurrency. The full-system model (`RamDiskSystem.tla`) was built to prevent such gaps.
 
 ## Building from Source
 

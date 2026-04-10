@@ -58,8 +58,10 @@ The WinFsp binding is provided by the [`WinFsp.Native`](https://www.nuget.org/pa
 - `nint[]` page table — index maps to native page pointer, `nint.Zero` = sparse (unallocated)
 - **Three-phase write** to minimize write-lock hold time:
   1. Read lock: scan which pages need allocation
-  2. No lock: unreserve own reservations (from `SetLength`), then batch-allocate pages from PagePool. Re-reserve on failure. (TLA+ verified — see `tla/PagePoolFixed.tla`)
-  3. Write lock: assign page table entries + memcpy only
+  2. No lock: batch-allocate pages from PagePool via `RentBatch`. On failure return pages and report DISK_FULL.
+  3. Write lock: assign page table entries + memcpy only. Race fallback: if a page was allocated by a concurrent writer between Phase 1 and 3, use single `Rent()`.
+- **Sparse SetLength**: extending a file only expands the page table (`nint.Zero` entries); no pages are reserved or allocated. Pages are allocated on demand in Write.
+- Full protocol verified with TLA+ — see `tla/RamDiskSystem.tla`.
 - `ReaderWriterLockSlim` per file — concurrent reads don't block each other
 - Truncation zeros partial page data and batch-returns freed pages
 
@@ -80,7 +82,7 @@ The WinFsp binding is provided by the [`WinFsp.Native`](https://www.nuget.org/pa
 ## WinFsp Notes
 
 - `fileSystemName` must be `"NTFS"` for elevated process compatibility.
-- `GetFileSecurityByName` returns `securityDescriptor = null` (sdSize=0) — WinFsp skips access checks.
+- `GetFileSecurityByName` returns the file's stored security descriptor. Root default: `O:BAG:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;WD)`. `GetFileSecurity`/`SetFileSecurity` implemented via `RawSecurityDescriptor` merge.
 - `ReadDirectory` uses native buffer with `WinFspFileSystem.AddDirInfo` / `EndDirInfo` — no IEnumerable allocation.
 - `SetMountPointEx` crashes on `"R:\"` (trailing backslash). Mount point format: `"R:"` = `DefineDosDevice` (invisible to disk tools), `"\\.\R:"` = Mount Manager (visible to all apps, requires admin or `MountUseMountmgrFromFSD=1` registry key). `WinFspHostedService` tries `\\.\R:` first, falls back to `R:` on failure.
 - **STATUS_PENDING async**: Must build a fresh stack-allocated `FspTransactRsp` with `Size`/`Kind`/`Hint` fields. Do NOT reuse `OperationContext->Response` — it may be invalidated after returning `STATUS_PENDING`. Save `Request->Hint` before returning, echo it back in the response.
@@ -122,23 +124,63 @@ dotnet run --project tests/RamDrive.Benchmarks -c Release -- e2e      # end-to-e
 
 ## Formal Verification (`tla/`)
 
-TLA+ models for the PagePool reservation protocol, verified with TLC model checker.
+TLA+ models verified with [TLC model checker](https://github.com/tlaplus/tlaplus). Requires Java 11+.
 
-**Background:** Kernel cache mode (`EnableKernelCache=true`) causes Windows to call `SetFileSize` (which reserves pages via `PagePool.Reserve`) before issuing `WriteFile` (which allocates pages via `PagePool.Rent`). The original code had `AllocateNewPageIfUnderCapacity` check `allocated + reserved >= maxPages`, which counted the caller's own reservations against it — causing spurious `STATUS_DISK_FULL` under concurrent file copies.
+### Downloading TLC
 
 ```bash
-# Requires Java 11+
-# Reproduce the bug (invariant NoSpuriousDiskFull violated)
-java -jar tla/tla2tools.jar tla/PagePoolReservation.tla
-
-# Verify the fix (all invariants + liveness pass)
-java -jar tla/tla2tools.jar tla/PagePoolFixed.tla
+# Download tla2tools.jar into tla/ (one-time, ~4 MB)
+curl -sL -o tla/tla2tools.jar https://github.com/tlaplus/tlaplus/releases/download/v1.8.0/tla2tools.jar
 ```
 
-- `tla/PagePoolReservation.tla` — buggy model: `NoSpuriousDiskFull` violated in 5 states
-- `tla/PagePoolFixed.tla` — fixed model: Write Phase 2 unreserves own reservations before `RentBatch`, then re-reserves on failure. Verified with MaxPages={4,6,8} × NumFiles={2,3,4}, all invariants (TypeOK, PoolConsistent, NoCapacityLeak, NoSpuriousDiskFull) + liveness pass.
+### Full-system model (`tla/RamDiskSystem.tla`)
 
-**Fix in code** (`PagedFileContent.Write` Phase 2): `Unreserve(min(fileReserved, needed))` before `RentBatch`, restore on failure. Phase 3 fallback `Rent()` path also unreserves one slot if available. This matches the TLA+ `PagePoolFixed.DoPhase2` spec.
+Models the complete concurrency protocol: PagePool accounting, per-file sparse page tables, 3-phase write, concurrent Read, CreateFile, Extend, Truncate, Delete, SetAllocationSize TOCTOU check, and GetVolumeInfo as an external observer.
+
+**Verified invariants:** PoolConsistent, NoPageLeak, FreeBytesAccurate, DataIntegrity, ReadConsistent, DeadFilesClean, SingleFileCap. **Liveness:** WriteTerminates.
+
+```bash
+# Smoke test (3 pages × 2 files, ~12 min, ~3M states)
+java -XX:+UseParallelGC -jar tla/tla2tools.jar -workers auto \
+     -config tla/RamDiskSystem_Minimal.cfg tla/RamDiskSystem.tla
+
+# Full verification (4 pages × 2 files, ~5h, ~66M states, needs ~60GB RAM for liveness)
+java -XX:+UseParallelGC -Xmx100g -jar tla/tla2tools.jar -workers auto \
+     -config tla/RamDiskSystem_Standard.cfg tla/RamDiskSystem.tla
+```
+
+### How the model maps to code
+
+| TLA+ Action | Code | Lock |
+|-------------|------|------|
+| `DoWriteP1(f, pages)` | `PagedFileContent.Write` Phase 1 | Read-lock |
+| `DoWriteP2(f)` | `PagedFileContent.Write` Phase 2 | None (CAS) |
+| `DoWriteP3(f)` | `PagedFileContent.Write` Phase 3 | Write-lock |
+| `DoExtend(f, newLen)` | `PagedFileContent.SetLength` (extend) | Write-lock |
+| `DoTruncate(f, newLen)` | `PagedFileContent.SetLength` (truncate) | Write-lock |
+| `DoDelete(f)` | `PagedFileContent.Dispose` | Write-lock |
+| `DoRead(f, p)` | `PagedFileContent.Read` | Read-lock |
+| `DoCreateFile(f)` | `RamFileSystem.CreateFile` | Structure-lock |
+| `DoSetAllocSize(f, n)` | `WinFspRamAdapter.SetFileSize` (alloc=true) | None |
+| `DoGetVolumeInfo` | `WinFspRamAdapter.GetVolumeInfo` | None |
+
+### Modeling guidelines
+
+When modifying the concurrency protocol, update the TLA+ model:
+
+1. **Add new actions** for any operation that mutates pool state (`poolAllocated`, `poolRented`) or per-file page tables.
+2. **Model at page granularity** — bytes are unnecessary; data tags (`0` = unallocated, `f` = file f's data) suffice.
+3. **External observers matter** — the old model missed a bug because it didn't include `GetVolumeInfo` reading `FreeBytes`. Any state read by WinFsp callbacks should be an observable action.
+4. **CAS loops are atomic** — model `Interlocked.CompareExchange` loops as single atomic steps (linearizable).
+5. **Locks = atomicity boundaries** — read-lock and write-lock regions each become one TLA+ action.
+6. **Run Minimal first** (~12 min) to catch bugs fast, then Standard (~5h) for full coverage.
+
+### Historical models
+
+- `tla/PagePoolReservation.tla` — original buggy model: `NoSpuriousDiskFull` violated
+- `tla/PagePoolFixed.tla` — narrow fix for the reserve/rent double-counting bug
+
+These are preserved as historical artifacts. The narrow scope of `PagePoolFixed.tla` missed the `FreeBytes` pollution bug (Reserve in SetLength changed `_reservedCount`, which changed `FreeBytes` reported by `GetVolumeInfo`, causing stale metadata). The full-system model `RamDiskSystem.tla` was built to prevent such scope gaps.
 
 ## AOT Configuration
 
@@ -219,4 +261,5 @@ All settings in `appsettings.jsonc` under `"RamDrive"` section, overridable via 
 | PageSizeKb | 64 | Page granularity (try 256 for large-file workloads) |
 | PreAllocate | false | true = allocate all memory at startup |
 | VolumeLabel | RamDrive | Explorer display name |
-| EnableKernelCache | true | Let Windows kernel cache file data; improves cached I/O throughput ~3x |
+| EnableKernelCache | false | Kernel page cache (~3x throughput). Uses WinFsp `FileInfoTimeout=MAX`. |
+| CreateTempDirectory | false | Create a `Temp` directory at root on mount |
