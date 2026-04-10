@@ -261,5 +261,5 @@ All settings in `appsettings.jsonc` under `"RamDrive"` section, overridable via 
 | PageSizeKb | 64 | Page granularity (try 256 for large-file workloads) |
 | PreAllocate | false | true = allocate all memory at startup |
 | VolumeLabel | RamDrive | Explorer display name |
-| EnableKernelCache | false | Kernel page cache (~3x throughput). Uses WinFsp `FileInfoTimeout=MAX`. |
+| EnableKernelCache | true | Kernel page cache (~3x throughput). Uses WinFsp `FileInfoTimeout=MAX`. |
 | CreateTempDirectory | false | Create a `Temp` directory at root on mount |

@@ -12,11 +12,8 @@ public sealed class RamDriveOptions
     /// Enable Windows kernel-level file data caching (sets WinFsp FileInfoTimeout=MAX).
     /// Improves throughput (~3x) by letting the OS cache manager serve repeated reads
     /// without calling back into user mode.
-    /// Warning: under high concurrency, WinFsp's metadata cache may return stale file sizes
-    /// because the lazy writer has not yet flushed dirty pages to user mode. This does not
-    /// corrupt data but can cause readers to see an outdated file size briefly.
     /// </summary>
-    public bool EnableKernelCache { get; set; }
+    public bool EnableKernelCache { get; set; } = true;
 
     /// <summary>
     /// Create a Temp directory at the root of the RAM disk after mounting.

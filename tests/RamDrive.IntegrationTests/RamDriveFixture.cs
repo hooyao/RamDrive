@@ -30,7 +30,7 @@ public sealed class RamDriveFixture : IDisposable
         {
             CapacityMb = CapacityMb,
             PageSizeKb = 64,
-            EnableKernelCache = false,
+            EnableKernelCache = true,
             VolumeLabel = "IntegrationTest",
         };
 

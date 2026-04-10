@@ -64,7 +64,7 @@ Edit `appsettings.jsonc` or override via command line (`--RamDrive:CapacityMb=40
     "PageSizeKb": 64,               // Page size (64 KB default, try 256 for large files)
     "PreAllocate": false,           // true = allocate all memory at startup
     "VolumeLabel": "RamDrive",      // Volume label in Explorer
-    "EnableKernelCache": false,     // Kernel page cache (~3x throughput, see docs)
+    "EnableKernelCache": true,      // Kernel page cache (~3x read throughput)
     "CreateTempDirectory": false    // Create a Temp dir on mount
   }
 }

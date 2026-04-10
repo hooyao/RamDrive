@@ -91,12 +91,7 @@ public class ChaosTests(RamDriveFixture fx)
         try { Directory.Delete(root, true); } catch { }
 
         Volatile.Read(ref unexpectedErrors).Should().Be(0, "no unexpected errors");
-        // WinFsp FileInfoTimeout=MAX causes stale file-size metadata under high concurrency:
-        // ReadAllBytes may see a stale size from WinFsp's metadata cache while the actual data
-        // is correct. Confirmed: 0 failures with kernel cache disabled. Allow up to 0.01%.
-        long maxAllowed = Math.Max(totalOps / 10000, 10);
-        Volatile.Read(ref integrityFails).Should().BeLessThanOrEqualTo(maxAllowed,
-            $"integrity failures should be < 0.01% of ops (allowed: {maxAllowed})");
+        Volatile.Read(ref integrityFails).Should().Be(0, "no integrity failures");
     }
 
     static void Run(Op op, Random rng, World w, ref long integrityFails)

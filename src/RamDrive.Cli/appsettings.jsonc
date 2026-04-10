@@ -29,7 +29,7 @@
     // without calling back into user mode.
     // Warning: under high concurrency, WinFsp's metadata cache may return stale file sizes
     // because the lazy writer has not yet flushed dirty pages to user mode.
-    "EnableKernelCache": false,
+    "EnableKernelCache": true,
 
     // Create a Temp directory at the root of the RAM disk after mounting.
     // Useful for redirecting TEMP/TMP environment variables to the RAM disk.
