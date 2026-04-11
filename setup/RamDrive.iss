@@ -62,8 +62,8 @@ Source: "{#WinFspMsi}"; DestDir: "{tmp}"; Flags: deleteafterinstall; Components:
 [Icons]
 Name: "{group}\{#MyAppName}";         Filename: "{app}\{#MyAppExeName}"
 Name: "{autodesktop}\{#MyAppName}";   Filename: "{app}\{#MyAppExeName}"; Tasks: desktopicon
-Name: "{group}\Edit Configuration";   Filename: "notepad.exe"; Parameters: """{app}\appsettings.jsonc"""
-Name: "{group}\Restart Service";      Filename: "cmd.exe"; Parameters: "/c sc.exe stop RamDrive & timeout /t 2 & sc.exe start RamDrive & pause"; Components: service
+Name: "{group}\Edit Configuration";   Filename: "notepad.exe"; Parameters: """{app}\appsettings.jsonc"""; AfterInstall: SetElevationBit('{group}\Edit Configuration.lnk')
+Name: "{group}\Restart Service";      Filename: "cmd.exe"; Parameters: "/c sc.exe stop RamDrive & timeout /t 2 & sc.exe start RamDrive & pause"; Components: service; AfterInstall: SetElevationBit('{group}\Restart Service.lnk')
 Name: "{group}\Uninstall {#MyAppName}"; Filename: "{uninstallexe}"
 
 [Code]
@@ -84,6 +84,25 @@ const
   UDM_SETBUDDY    = $0469;
   UDM_SETRANGE32  = $046F;
   UDM_SETPOS32    = $0471;
+
+procedure SetElevationBit(Filename: string);
+var
+  Buffer: string;
+  Stream: TStream;
+begin
+  Filename := ExpandConstant(Filename);
+  Stream := TFileStream.Create(Filename, fmOpenReadWrite);
+  try
+    Stream.Seek(21, soFromBeginning);
+    SetLength(Buffer, 1);
+    Stream.ReadBuffer(Buffer, 1);
+    Buffer[1] := Chr(Ord(Buffer[1]) or $20);
+    Stream.Seek(-1, soFromCurrent);
+    Stream.WriteBuffer(Buffer, 1);
+  finally
+    Stream.Free;
+  end;
+end;
 
 var
   ConfigPage: TWizardPage;
