@@ -133,8 +133,7 @@ internal sealed class WinFspHostedService : BackgroundService
         if (_options.InitialDirectories is not { Count: > 0 })
             return;
 
-        var errors = new List<string>();
-        ValidateDirectoryTree(_options.InitialDirectories, "", errors);
+        var errors = _options.InitialDirectories.Validate();
         if (errors.Count > 0)
         {
             _logger.LogError(
@@ -146,53 +145,6 @@ internal sealed class WinFspHostedService : BackgroundService
 
         var count = CreateDirectoriesRecursive(@"\", _options.InitialDirectories);
         _logger.LogInformation("Created {Count} initial directories on RAM disk", count);
-    }
-
-    private static void ValidateDirectoryTree(DirectoryNode entries, string parentPath, List<string> errors)
-    {
-        foreach (var (name, children) in entries)
-        {
-            var displayPath = string.IsNullOrEmpty(parentPath) ? name : parentPath + @"\" + name;
-
-            if (string.IsNullOrWhiteSpace(name))
-            {
-                errors.Add($"  - Empty directory name under \"{parentPath}\"");
-                continue;
-            }
-
-            if (name.IndexOfAny(InvalidChars) >= 0)
-            {
-                errors.Add($"  - \"{displayPath}\": contains invalid character(s). Avoid < > : \" / \\ | ? *");
-                continue;
-            }
-
-            if (IsReservedName(name))
-            {
-                errors.Add($"  - \"{displayPath}\": is a Windows reserved name (CON, PRN, NUL, etc.)");
-                continue;
-            }
-
-            if (name.Length > 255)
-            {
-                errors.Add($"  - \"{displayPath}\": name exceeds 255 characters");
-                continue;
-            }
-
-            if (children.Count > 0)
-                ValidateDirectoryTree(children, displayPath, errors);
-        }
-    }
-
-    private static readonly char[] InvalidChars = ['<', '>', ':', '"', '/', '\\', '|', '?', '*'];
-
-    private static bool IsReservedName(string name)
-    {
-        var upper = name.ToUpperInvariant();
-        // Strip trailing dot/space — Windows treats "CON." and "CON " as reserved too
-        upper = upper.TrimEnd('.', ' ');
-        return upper is "CON" or "PRN" or "AUX" or "NUL"
-            or "COM1" or "COM2" or "COM3" or "COM4" or "COM5" or "COM6" or "COM7" or "COM8" or "COM9"
-            or "LPT1" or "LPT2" or "LPT3" or "LPT4" or "LPT5" or "LPT6" or "LPT7" or "LPT8" or "LPT9";
     }
 
     private int CreateDirectoriesRecursive(string parentPath, DirectoryNode entries)

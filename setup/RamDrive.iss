@@ -272,59 +272,50 @@ var
   Letter: String;
   Cap: String;
   Lines: TArrayOfString;
+  I: Integer;
 begin
   Letter := Copy(DriveCombo.Items[DriveCombo.ItemIndex], 1, 1);
   Cap := Trim(CapacityEdit.Text);
   ConfigPath := ExpandConstant('{app}\appsettings.jsonc');
 
+  // Common prefix (lines 0..14) + variable suffix
+  if CreateTempCheckbox.Checked then
+    SetArrayLength(Lines, 21)
+  else
+    SetArrayLength(Lines, 19);
+
+  Lines[0]  := '{';
+  Lines[1]  := '  "Logging": {';
+  Lines[2]  := '    "LogLevel": {';
+  Lines[3]  := '      "Default": "Information",';
+  Lines[4]  := '      "Microsoft": "Warning"';
+  Lines[5]  := '    }';
+  Lines[6]  := '  },';
+  Lines[7]  := '';
+  Lines[8]  := '  "RamDrive": {';
+  Lines[9]  := '    "MountPoint": "' + Letter + ':\\",';
+  Lines[10] := '    "CapacityMb": ' + Cap + ',';
+  Lines[11] := '    "PageSizeKb": 64,';
+  Lines[12] := '    "PreAllocate": false,';
+  Lines[13] := '    "VolumeLabel": "RamDrive",';
+  Lines[14] := '    "EnableKernelCache": true,';
+
   if CreateTempCheckbox.Checked then
   begin
-    SetArrayLength(Lines, 21);
-    Lines[0]  := '{';
-    Lines[1]  := '  "Logging": {';
-    Lines[2]  := '    "LogLevel": {';
-    Lines[3]  := '      "Default": "Information",';
-    Lines[4]  := '      "Microsoft": "Warning"';
-    Lines[5]  := '    }';
-    Lines[6]  := '  },';
-    Lines[7]  := '';
-    Lines[8]  := '  "RamDrive": {';
-    Lines[9]  := '    "MountPoint": "' + Letter + ':\\",';
-    Lines[10] := '    "CapacityMb": ' + Cap + ',';
-    Lines[11] := '    "PageSizeKb": 64,';
-    Lines[12] := '    "PreAllocate": false,';
-    Lines[13] := '    "VolumeLabel": "RamDrive",';
-    Lines[14] := '    "EnableKernelCache": true,';
     Lines[15] := '    "InitialDirectories": {';
     Lines[16] := '      "Temp": {}';
     Lines[17] := '    }';
-    Lines[18] := '  }';
-    Lines[19] := '}';
-    Lines[20] := '';
+    I := 18;
   end
   else
   begin
-    SetArrayLength(Lines, 19);
-    Lines[0]  := '{';
-    Lines[1]  := '  "Logging": {';
-    Lines[2]  := '    "LogLevel": {';
-    Lines[3]  := '      "Default": "Information",';
-    Lines[4]  := '      "Microsoft": "Warning"';
-    Lines[5]  := '    }';
-    Lines[6]  := '  },';
-    Lines[7]  := '';
-    Lines[8]  := '  "RamDrive": {';
-    Lines[9]  := '    "MountPoint": "' + Letter + ':\\",';
-    Lines[10] := '    "CapacityMb": ' + Cap + ',';
-    Lines[11] := '    "PageSizeKb": 64,';
-    Lines[12] := '    "PreAllocate": false,';
-    Lines[13] := '    "VolumeLabel": "RamDrive",';
-    Lines[14] := '    "EnableKernelCache": true,';
     Lines[15] := '    "InitialDirectories": {}';
-    Lines[16] := '  }';
-    Lines[17] := '}';
-    Lines[18] := '';
+    I := 16;
   end;
+
+  Lines[I]     := '  }';
+  Lines[I + 1] := '}';
+  Lines[I + 2] := '';
 
   SaveStringsToUTF8File(ConfigPath, Lines, False);
 end;
