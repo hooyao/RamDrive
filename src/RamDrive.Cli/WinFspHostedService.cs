@@ -78,6 +78,7 @@ internal sealed class WinFspHostedService : BackgroundService
                 if (result < 0)
                 {
                     _logger.LogError("WinFsp mount failed: 0x{Status:X8}", result);
+                    Environment.ExitCode = 1;
                     _lifetime.StopApplication();
                     return;
                 }
@@ -85,14 +86,14 @@ internal sealed class WinFspHostedService : BackgroundService
                 _logger.LogInformation("Drive mounted at {MountPoint} via DefineDosDevice.", _options.MountPoint);
             }
 
-            if (_options.CreateTempDirectory)
-                CreateTempDirectoryOnDrive();
+            CreateInitialDirectories();
 
             await Task.Delay(Timeout.Infinite, stoppingToken);
         }
         catch (DllNotFoundException)
         {
             _logger.LogError("WinFsp is not installed. Install from: https://winfsp.dev/rel/");
+            Environment.ExitCode = 1;
             _lifetime.StopApplication();
         }
         catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
@@ -102,6 +103,7 @@ internal sealed class WinFspHostedService : BackgroundService
         catch (Exception ex)
         {
             _logger.LogError(ex, "Unexpected error during mount");
+            Environment.ExitCode = 1;
             _lifetime.StopApplication();
         }
     }
@@ -126,13 +128,87 @@ internal sealed class WinFspHostedService : BackgroundService
         _logger.LogInformation("Drive unmounted");
     }
 
-    private void CreateTempDirectoryOnDrive()
+    private void CreateInitialDirectories()
     {
-        var node = _fs.CreateDirectory(@"\Temp");
-        if (node != null)
-            _logger.LogInformation("Created Temp directory on RAM disk");
-        else
-            _logger.LogWarning("Failed to create Temp directory on RAM disk (already exists or root missing)");
+        if (_options.InitialDirectories is not { Count: > 0 })
+            return;
+
+        var errors = new List<string>();
+        ValidateDirectoryTree(_options.InitialDirectories, "", errors);
+        if (errors.Count > 0)
+        {
+            _logger.LogError(
+                "Invalid InitialDirectories configuration. Please fix appsettings.jsonc:{NewLine}{Errors}",
+                Environment.NewLine,
+                string.Join(Environment.NewLine, errors));
+            return;
+        }
+
+        var count = CreateDirectoriesRecursive(@"\", _options.InitialDirectories);
+        _logger.LogInformation("Created {Count} initial directories on RAM disk", count);
+    }
+
+    private static void ValidateDirectoryTree(DirectoryNode entries, string parentPath, List<string> errors)
+    {
+        foreach (var (name, children) in entries)
+        {
+            var displayPath = string.IsNullOrEmpty(parentPath) ? name : parentPath + @"\" + name;
+
+            if (string.IsNullOrWhiteSpace(name))
+            {
+                errors.Add($"  - Empty directory name under \"{parentPath}\"");
+                continue;
+            }
+
+            if (name.IndexOfAny(InvalidChars) >= 0)
+            {
+                errors.Add($"  - \"{displayPath}\": contains invalid character(s). Avoid < > : \" / \\ | ? *");
+                continue;
+            }
+
+            if (IsReservedName(name))
+            {
+                errors.Add($"  - \"{displayPath}\": is a Windows reserved name (CON, PRN, NUL, etc.)");
+                continue;
+            }
+
+            if (name.Length > 255)
+            {
+                errors.Add($"  - \"{displayPath}\": name exceeds 255 characters");
+                continue;
+            }
+
+            if (children.Count > 0)
+                ValidateDirectoryTree(children, displayPath, errors);
+        }
+    }
+
+    private static readonly char[] InvalidChars = ['<', '>', ':', '"', '/', '\\', '|', '?', '*'];
+
+    private static bool IsReservedName(string name)
+    {
+        var upper = name.ToUpperInvariant();
+        // Strip trailing dot/space — Windows treats "CON." and "CON " as reserved too
+        upper = upper.TrimEnd('.', ' ');
+        return upper is "CON" or "PRN" or "AUX" or "NUL"
+            or "COM1" or "COM2" or "COM3" or "COM4" or "COM5" or "COM6" or "COM7" or "COM8" or "COM9"
+            or "LPT1" or "LPT2" or "LPT3" or "LPT4" or "LPT5" or "LPT6" or "LPT7" or "LPT8" or "LPT9";
+    }
+
+    private int CreateDirectoriesRecursive(string parentPath, DirectoryNode entries)
+    {
+        int count = 0;
+        foreach (var (name, children) in entries)
+        {
+            var path = parentPath == @"\" ? @"\" + name : parentPath + @"\" + name;
+            if (_fs.CreateDirectory(path) != null)
+                count++;
+
+            if (children.Count > 0)
+                count += CreateDirectoriesRecursive(path, children);
+        }
+
+        return count;
     }
 
     /// <summary>

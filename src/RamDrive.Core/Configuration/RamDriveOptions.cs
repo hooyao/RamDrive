@@ -16,8 +16,9 @@ public sealed class RamDriveOptions
     public bool EnableKernelCache { get; set; } = true;
 
     /// <summary>
-    /// Create a Temp directory at the root of the RAM disk after mounting.
-    /// Useful for redirecting TEMP/TMP environment variables to the RAM disk.
+    /// Tree of directories to create at the root of the RAM disk after mounting.
+    /// JSON keys are directory names; nested objects define subdirectories.
+    /// Example: <c>{ "Temp": {}, "Cache": { "App1": {} } }</c>
     /// </summary>
-    public bool CreateTempDirectory { get; set; }
+    public DirectoryNode? InitialDirectories { get; set; }
 }
