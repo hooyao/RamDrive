@@ -31,8 +31,9 @@
     // because the lazy writer has not yet flushed dirty pages to user mode.
     "EnableKernelCache": true,
 
-    // Create a Temp directory at the root of the RAM disk after mounting.
-    // Useful for redirecting TEMP/TMP environment variables to the RAM disk.
-    "CreateTempDirectory": false
+    // Directories to create automatically after mounting.
+    // JSON keys are directory names; nested objects define subdirectories.
+    // Example: { "Temp": {}, "Cache": { "App1": {}, "App2": {} } }
+    "InitialDirectories": {}
   }
 }

@@ -65,7 +65,9 @@ Edit `appsettings.jsonc` or override via command line (`--RamDrive:CapacityMb=40
     "PreAllocate": false,           // true = allocate all memory at startup
     "VolumeLabel": "RamDrive",      // Volume label in Explorer
     "EnableKernelCache": true,      // Kernel page cache (~3x read throughput)
-    "CreateTempDirectory": false    // Create a Temp dir on mount
+    "InitialDirectories": {         // Directories created on mount
+      "Temp": {}                    //   e.g. { "Temp": {}, "Cache": { "App1": {} } }
+    }
   }
 }
 ```

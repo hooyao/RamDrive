@@ -159,7 +159,7 @@ begin
   InfoLbl.Left := 0;
   InfoLbl.Width := ConfigPage.SurfaceWidth;
   InfoLbl.Caption :=
-    'To change these settings after installation:' + #13#10 +
+    'To add more initial directories or change settings after installation:' + #13#10 +
     '1. Edit appsettings.jsonc (Start Menu > RamDrive > Edit Configuration)' + #13#10 +
     '2. Restart the service (Start Menu > RamDrive > Restart Service)';
 end;
@@ -271,18 +271,19 @@ var
   ConfigPath: String;
   Letter: String;
   Cap: String;
-  CreateTemp: String;
   Lines: TArrayOfString;
+  I: Integer;
 begin
   Letter := Copy(DriveCombo.Items[DriveCombo.ItemIndex], 1, 1);
   Cap := Trim(CapacityEdit.Text);
-  if CreateTempCheckbox.Checked then
-    CreateTemp := 'true'
-  else
-    CreateTemp := 'false';
   ConfigPath := ExpandConstant('{app}\appsettings.jsonc');
 
-  SetArrayLength(Lines, 20);
+  // Common prefix (lines 0..14) + variable suffix
+  if CreateTempCheckbox.Checked then
+    SetArrayLength(Lines, 21)
+  else
+    SetArrayLength(Lines, 19);
+
   Lines[0]  := '{';
   Lines[1]  := '  "Logging": {';
   Lines[2]  := '    "LogLevel": {';
@@ -298,10 +299,23 @@ begin
   Lines[12] := '    "PreAllocate": false,';
   Lines[13] := '    "VolumeLabel": "RamDrive",';
   Lines[14] := '    "EnableKernelCache": true,';
-  Lines[15] := '    "CreateTempDirectory": ' + CreateTemp;
-  Lines[16] := '  }';
-  Lines[17] := '}';
-  Lines[18] := '';
+
+  if CreateTempCheckbox.Checked then
+  begin
+    Lines[15] := '    "InitialDirectories": {';
+    Lines[16] := '      "Temp": {}';
+    Lines[17] := '    }';
+    I := 18;
+  end
+  else
+  begin
+    Lines[15] := '    "InitialDirectories": {}';
+    I := 16;
+  end;
+
+  Lines[I]     := '  }';
+  Lines[I + 1] := '}';
+  Lines[I + 2] := '';
 
   SaveStringsToUTF8File(ConfigPath, Lines, False);
 end;

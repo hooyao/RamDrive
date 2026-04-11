@@ -262,4 +262,4 @@ All settings in `appsettings.jsonc` under `"RamDrive"` section, overridable via 
 | PreAllocate | false | true = allocate all memory at startup |
 | VolumeLabel | RamDrive | Explorer display name |
 | EnableKernelCache | true | Kernel page cache (~3x throughput). Uses WinFsp `FileInfoTimeout=MAX`. |
-| CreateTempDirectory | false | Create a `Temp` directory at root on mount |
+| InitialDirectories | `{}` | Tree of directories to create on mount (e.g. `{ "Temp": {} }`) |
