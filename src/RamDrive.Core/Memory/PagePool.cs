@@ -62,14 +62,11 @@ public sealed class PagePool : IDisposable
         while (true)
         {
             long currentReserved = Volatile.Read(ref _reservedCount);
-            long currentAllocated = Volatile.Read(ref _allocatedCount);
             long currentRented = Volatile.Read(ref _rentedCount);
-            // Free stack pages are already allocated but available — they don't need reservation.
-            // Effective committed = allocated (includes free stack + rented) + reserved (not yet allocated).
-            // Max allowed: _maxPages. So: allocated + reserved + count <= _maxPages.
-            // But rented pages came from either free stack or new allocation. Reservations cover
-            // future allocations beyond what's already allocated.
-            if (currentAllocated + currentReserved + count > _maxPages)
+            // Total committed = rented (in-use) + reserved (promised to future writes).
+            // Must not exceed capacity. Free stack pages are available for both
+            // reserved writes and new rentals, so they don't count as committed.
+            if (currentRented + currentReserved + count > _maxPages)
                 return false;
             if (Interlocked.CompareExchange(ref _reservedCount, currentReserved + count, currentReserved) == currentReserved)
                 return true;

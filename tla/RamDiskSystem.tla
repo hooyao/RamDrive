@@ -1,17 +1,21 @@
 ------------------------- MODULE RamDiskSystem -------------------------
 \* Full-system TLA+ model for the RamDrive file system.
 \*
-\* Covers: PagePool accounting, per-file sparse page tables, 3-phase write,
-\* Read (concurrent with write), SetLength (extend/truncate), Delete,
-\* CreateFile (slot reuse), OverwriteFile, SetAllocationSize TOCTOU check,
-\* and GetVolumeInfo as an external observer.
+\* Covers: PagePool accounting, per-file sparse page tables, 3-phase write
+\* (including Phase 3 deficit fallback), Read (concurrent with write),
+\* SetLength (extend/truncate — concurrent with write phases),
+\* Delete, CreateFile (slot reuse), OverwriteFile with allocationSize
+\* check, SetAllocationSize TOCTOU check, GetVolumeInfo as an external
+\* observer, and per-file capacity reservation.
+\*
+\* SetLength can interleave with in-flight writes (between phases where
+\* no per-file lock is held). This models concurrent truncation creating
+\* more page holes than Phase 1 predicted, triggering the Phase 3
+\* deficit fallback path in code.
 \*
 \* Move/Rename is NOT modeled because it only mutates the directory tree
 \* under _structureLock (atomic, serialized) and does not touch page tables
 \* or pool state. No concurrency hazard beyond the structure lock.
-\*
-\* Replaces the narrow PagePoolFixed.tla model that missed the FreeBytes
-\* pollution bug caused by Reserve() in SetLength.
 
 EXTENDS Integers, FiniteSets, Sequences, TLC
 
@@ -36,6 +40,7 @@ VARIABLES
     fileLength,       \* Logical length in pages (sparse: pages may be unallocated)
     filePages,        \* Sparse page table: [pageIndex -> DataValues]
     fileAlive,        \* TRUE = file exists, FALSE = deleted
+    fileReserved,     \* Pages reserved in pool but not yet allocated (per-file)
 
     \* ── Per-file operation state machine ──
     fileOp,           \* Operation state
@@ -47,14 +52,14 @@ VARIABLES
     lastReadFile,     \* Which file was last read (0 = none)
     lastReadVal,      \* Data tag from last read
 
-    \* ── SetAllocSize result ──
+    \* ── SetAllocSize / OverwriteFile result ──
     allocResult,      \* [Files -> {"none","ok","full"}]
 
     \* ── External observer ──
     observedFree      \* Last GetVolumeInfo result (in pages)
 
 vars == <<poolAllocated, poolRented,
-          fileLength, filePages, fileAlive,
+          fileLength, filePages, fileAlive, fileReserved,
           fileOp, writeTarget, writePreAlloc, writeRange,
           lastReadFile, lastReadVal, allocResult,
           observedFree>>
@@ -65,7 +70,17 @@ OpStates == {"idle", "w_p1", "w_p2"}
    Helpers
    ================================================================ *)
 FreeStack == poolAllocated - poolRented
-FreePages == MaxPages - poolRented
+
+\* Total reservations across all files
+TotalReserved ==
+    LET RECURSIVE SumRes(_)
+        SumRes(S) == IF S = {} THEN 0
+                     ELSE LET f == CHOOSE x \in S : TRUE
+                          IN fileReserved[f] + SumRes(S \ {f})
+    IN SumRes(Files)
+
+\* Available pages = total - rented - reserved
+FreePages == MaxPages - poolRented - TotalReserved
 
 \* Total allocated (non-zero) pages across all files (alive or in-transit)
 TotalFilePages ==
@@ -84,6 +99,12 @@ TotalPreAlloc ==
                        IN writePreAlloc[f] + Sum(S \ {f})
     IN Sum(Files)
 
+\* Allocated page count for a single file
+FileAllocCount(f) == Cardinality({p \in PageIndices : filePages[f][p] # 0})
+
+\* Maximum element of a non-empty set of naturals
+MaxElement(S) == CHOOSE p \in S : \A q \in S : q <= p
+
 (* ================================================================
    Type Invariant
    ================================================================ *)
@@ -93,6 +114,7 @@ TypeOK ==
     /\ fileLength \in [Files -> 0..MaxPages]
     /\ filePages \in [Files -> [PageIndices -> DataValues]]
     /\ fileAlive \in [Files -> BOOLEAN]
+    /\ fileReserved \in [Files -> 0..MaxPages]
     /\ fileOp \in [Files -> OpStates]
     /\ writeTarget \in [Files -> SUBSET PageIndices]
     /\ writePreAlloc \in [Files -> 0..MaxPages]
@@ -100,7 +122,7 @@ TypeOK ==
     /\ lastReadFile \in 0..NumFiles
     /\ lastReadVal \in DataValues
     /\ allocResult \in [Files -> {"none", "ok", "full"}]
-    /\ observedFree \in 0..MaxPages
+    /\ observedFree \in -(MaxPages)..MaxPages
 
 (* ================================================================
    Init
@@ -111,6 +133,7 @@ Init ==
     /\ fileLength = [f \in Files |-> 0]
     /\ filePages = [f \in Files |-> [p \in PageIndices |-> 0]]
     /\ fileAlive = [f \in Files |-> TRUE]
+    /\ fileReserved = [f \in Files |-> 0]
     /\ fileOp = [f \in Files |-> "idle"]
     /\ writeTarget = [f \in Files |-> {}]
     /\ writePreAlloc = [f \in Files |-> 0]
@@ -130,7 +153,7 @@ DoCreateFile(f) ==
     /\ fileAlive' = [fileAlive EXCEPT ![f] = TRUE]
     /\ fileLength' = [fileLength EXCEPT ![f] = 0]
     \* filePages already all 0 from DoDelete (enforced by DeadFilesClean)
-    /\ UNCHANGED <<poolAllocated, poolRented, filePages,
+    /\ UNCHANGED <<poolAllocated, poolRented, filePages, fileReserved,
                     fileOp, writeTarget, writePreAlloc, writeRange,
                     lastReadFile, lastReadVal, allocResult, observedFree>>
 
@@ -151,20 +174,25 @@ DoWriteP1(f, pages) ==
        /\ writeRange' = [writeRange EXCEPT ![f] = pages]
        /\ fileOp' = [fileOp EXCEPT ![f] = "w_p1"]
        /\ UNCHANGED <<poolAllocated, poolRented,
-                       fileLength, filePages, fileAlive,
+                       fileLength, filePages, fileAlive, fileReserved,
                        writePreAlloc,
                        lastReadFile, lastReadVal, allocResult, observedFree>>
 
 (* ================================================================
    Write Phase 2: allocate pages from pool (NO lock)
    Lock-free: RentBatch from pool. Fail = DISK_FULL.
+   Unreserves from file's reservations first (CAS in code), freeing
+   capacity for actual allocation.
    ================================================================ *)
 DoWriteP2(f) ==
     /\ fileOp[f] = "w_p1"
     /\ LET needed == Cardinality(writeTarget[f])
+           \* Unreserve from this file's reservations to free capacity
+           toUnreserve == IF fileReserved[f] >= needed
+                          THEN needed ELSE fileReserved[f]
            fromFree == IF FreeStack >= needed THEN needed ELSE FreeStack
            toAlloc == needed - fromFree
-           canAlloc == poolAllocated + toAlloc <= MaxPages
+           canAlloc == poolAllocated + toAlloc + (TotalReserved - toUnreserve) <= MaxPages
        IN
        IF needed = 0
        THEN
@@ -172,12 +200,13 @@ DoWriteP2(f) ==
            /\ writePreAlloc' = [writePreAlloc EXCEPT ![f] = 0]
            /\ fileOp' = [fileOp EXCEPT ![f] = "w_p2"]
            /\ UNCHANGED <<poolAllocated, poolRented,
-                           fileLength, filePages, fileAlive,
+                           fileLength, filePages, fileAlive, fileReserved,
                            writeTarget, writeRange,
                            lastReadFile, lastReadVal, allocResult, observedFree>>
        ELSE IF canAlloc
        THEN
-           \* Success: rent pages
+           \* Success: unreserve, then rent pages
+           /\ fileReserved' = [fileReserved EXCEPT ![f] = fileReserved[f] - toUnreserve]
            /\ poolAllocated' = poolAllocated + toAlloc
            /\ poolRented' = poolRented + needed
            /\ writePreAlloc' = [writePreAlloc EXCEPT ![f] = needed]
@@ -186,43 +215,113 @@ DoWriteP2(f) ==
                            writeTarget, writeRange,
                            lastReadFile, lastReadVal, allocResult, observedFree>>
        ELSE
-           \* Failure: DISK_FULL — return to idle
+           \* Failure: DISK_FULL — return to idle (no state changed)
            /\ fileOp' = [fileOp EXCEPT ![f] = "idle"]
            /\ writeTarget' = [writeTarget EXCEPT ![f] = {}]
            /\ writeRange' = [writeRange EXCEPT ![f] = {}]
            /\ writePreAlloc' = [writePreAlloc EXCEPT ![f] = 0]
            /\ UNCHANGED <<poolAllocated, poolRented,
-                           fileLength, filePages, fileAlive,
+                           fileLength, filePages, fileAlive, fileReserved,
                            lastReadFile, lastReadVal, allocResult, observedFree>>
 
 (* ================================================================
    Write Phase 3: assign pages + write data (write-lock)
    Exclusive with Read on the same file.
-   Handle race: page may have been allocated by concurrent writer
-   between Phase 1 scan and Phase 3 lock acquisition.
+
+   Handles two scenarios:
+   (a) SURPLUS — concurrent writer filled gaps between Phase 1 and 3,
+       so fewer pages need our pre-alloc. Return excess to pool.
+   (b) DEFICIT — concurrent truncation between phases freed pages,
+       creating more holes than Phase 1 predicted. Fall back to
+       single-page Rent with CAS unreserve from file reservations.
+       Maps to the code's Phase 3 fallback path.
+
+   Also extends fileLength if concurrent truncation shrunk it below
+   the write range (code: `if (endOffset > _length) _length = endOffset`).
    ================================================================ *)
 DoWriteP3(f) ==
     /\ fileOp[f] = "w_p2"
     /\ LET
-           \* Pages still unallocated (need our pre-alloc)
-           stillUnalloc == {p \in writeTarget[f] : filePages[f][p] = 0}
-           consumed == Cardinality(stillUnalloc)
-           \* Pre-alloc pages not consumed (race: another writer allocated them)
-           excess == writePreAlloc[f] - consumed
+           \* Recount unallocated pages in write range — may differ from
+           \* Phase 1 scan due to concurrent truncation/extension
+           needPages == {p \in writeRange[f] : filePages[f][p] = 0}
+           pagesNeeded == Cardinality(needPages)
+           surplus == writePreAlloc[f] - pagesNeeded
+           \* Write extends fileLength if truncation shrunk it
+           maxWriteIdx == MaxElement(writeRange[f])
+           newLen == IF maxWriteIdx + 1 > fileLength[f]
+                     THEN maxWriteIdx + 1 ELSE fileLength[f]
            \* New page table: write data tag to all target pages
            newPages == [p \in PageIndices |->
-               IF p \in writeRange[f] THEN f   \* Write our data
-               ELSE filePages[f][p]]           \* Keep existing
+               IF p \in writeRange[f] THEN f
+               ELSE filePages[f][p]]
+           \* After writing, compute correct reservation to fix over-reservation
+           \* caused by concurrent SetLength during write phases.
+           \* (Code: CAS loop at end of Phase 3 adjusts _reservedPages.)
+           newAllocInRange == Cardinality({p \in 0..(newLen - 1) : newPages[p] # 0})
+           correctReserved == IF newLen > newAllocInRange
+                              THEN newLen - newAllocInRange ELSE 0
        IN
-       /\ filePages' = [filePages EXCEPT ![f] = newPages]
-       \* Return excess pre-alloc pages to pool
-       /\ poolRented' = poolRented - excess
-       /\ writePreAlloc' = [writePreAlloc EXCEPT ![f] = 0]
-       /\ writeTarget' = [writeTarget EXCEPT ![f] = {}]
-       /\ writeRange' = [writeRange EXCEPT ![f] = {}]
-       /\ fileOp' = [fileOp EXCEPT ![f] = "idle"]
-       /\ UNCHANGED <<poolAllocated, fileLength, fileAlive,
-                       lastReadFile, lastReadVal, allocResult, observedFree>>
+       IF surplus >= 0 THEN
+           \* SURPLUS or exact: assign pre-alloc pages, return excess
+           LET adjustedReserved == IF fileReserved[f] > correctReserved
+                                   THEN correctReserved ELSE fileReserved[f]
+           IN
+           /\ filePages' = [filePages EXCEPT ![f] = newPages]
+           /\ fileLength' = [fileLength EXCEPT ![f] = newLen]
+           /\ fileReserved' = [fileReserved EXCEPT ![f] = adjustedReserved]
+           /\ poolRented' = poolRented - surplus
+           /\ writePreAlloc' = [writePreAlloc EXCEPT ![f] = 0]
+           /\ writeTarget' = [writeTarget EXCEPT ![f] = {}]
+           /\ writeRange' = [writeRange EXCEPT ![f] = {}]
+           /\ fileOp' = [fileOp EXCEPT ![f] = "idle"]
+           /\ UNCHANGED <<poolAllocated, fileAlive,
+                           lastReadFile, lastReadVal, allocResult, observedFree>>
+       ELSE
+           \* DEFICIT: need more pages than pre-allocated
+           LET deficit == -surplus
+               \* CAS unreserve from file's reservations (code: CAS loop)
+               toUnreserve == IF fileReserved[f] >= deficit
+                              THEN deficit ELSE fileReserved[f]
+               reservedAfterUnreserve == fileReserved[f] - toUnreserve
+               \* Also adjust for over-reservation
+               adjustedReserved == IF reservedAfterUnreserve > correctReserved
+                                   THEN correctReserved
+                                   ELSE reservedAfterUnreserve
+               \* Try to rent deficit pages from pool
+               fromFree == IF FreeStack >= deficit THEN deficit ELSE FreeStack
+               toAlloc == deficit - fromFree
+               canRent == poolAllocated + toAlloc
+                          + (TotalReserved - toUnreserve
+                             - (reservedAfterUnreserve - adjustedReserved))
+                          <= MaxPages
+           IN
+           IF canRent THEN
+               \* Success: rent additional pages, write all data
+               /\ filePages' = [filePages EXCEPT ![f] = newPages]
+               /\ fileLength' = [fileLength EXCEPT ![f] = newLen]
+               /\ fileReserved' = [fileReserved EXCEPT
+                      ![f] = adjustedReserved]
+               /\ poolAllocated' = poolAllocated + toAlloc
+               /\ poolRented' = poolRented + deficit
+               /\ writePreAlloc' = [writePreAlloc EXCEPT ![f] = 0]
+               /\ writeTarget' = [writeTarget EXCEPT ![f] = {}]
+               /\ writeRange' = [writeRange EXCEPT ![f] = {}]
+               /\ fileOp' = [fileOp EXCEPT ![f] = "idle"]
+               /\ UNCHANGED <<fileAlive,
+                               lastReadFile, lastReadVal, allocResult,
+                               observedFree>>
+           ELSE
+               \* Failure: return all pre-alloc pages, abort write
+               /\ poolRented' = poolRented - writePreAlloc[f]
+               /\ writePreAlloc' = [writePreAlloc EXCEPT ![f] = 0]
+               /\ writeTarget' = [writeTarget EXCEPT ![f] = {}]
+               /\ writeRange' = [writeRange EXCEPT ![f] = {}]
+               /\ fileOp' = [fileOp EXCEPT ![f] = "idle"]
+               /\ UNCHANGED <<poolAllocated, fileLength, filePages,
+                               fileAlive, fileReserved,
+                               lastReadFile, lastReadVal, allocResult,
+                               observedFree>>
 
 (* ================================================================
    Read: observe a page (read-lock on file)
@@ -236,33 +335,50 @@ DoRead(f, p) ==
     /\ lastReadFile' = f
     /\ lastReadVal' = filePages[f][p]
     /\ UNCHANGED <<poolAllocated, poolRented,
-                    fileLength, filePages, fileAlive,
+                    fileLength, filePages, fileAlive, fileReserved,
                     fileOp, writeTarget, writePreAlloc, writeRange,
                     allocResult, observedFree>>
 
 (* ================================================================
-   SetLength: extend (write-lock)
-   Sparse: just set logical length, no page allocation.
-   Fails if single file would exceed total pool capacity.
+   SetLength: extend (write-lock on file)
+   Reserves capacity in the pool for unallocated pages. This prevents
+   aggregate file sizes from exceeding total capacity and guarantees
+   subsequent writes will succeed (required for kernel cache mode).
+   Fails if available capacity is insufficient.
+
+   Can interleave with write phases: between Phase 1 (read-lock
+   released) and Phase 3 (write-lock acquired), another thread can
+   acquire the write-lock and call SetLength. This is the mechanism
+   that triggers Phase 3's deficit path.
    ================================================================ *)
 DoExtend(f, newLen) ==
-    /\ fileOp[f] = "idle"
+    /\ fileOp[f] \in {"idle", "w_p1", "w_p2"}
     /\ fileAlive[f]
     /\ newLen > fileLength[f]
     /\ newLen <= MaxPages
-    /\ fileLength' = [fileLength EXCEPT ![f] = newLen]
-    /\ UNCHANGED <<poolAllocated, poolRented,
-                    filePages, fileAlive,
-                    fileOp, writeTarget, writePreAlloc, writeRange,
-                    lastReadFile, lastReadVal, allocResult, observedFree>>
+    /\ LET allocCount == FileAllocCount(f)
+           \* Pages needing reservation = new page count - already allocated - already reserved
+           additionalNeeded == newLen - allocCount - fileReserved[f]
+           needed == IF additionalNeeded > 0 THEN additionalNeeded ELSE 0
+       IN
+       \* Guard: enough free capacity for new reservations
+       /\ needed <= FreePages
+       /\ fileLength' = [fileLength EXCEPT ![f] = newLen]
+       /\ fileReserved' = [fileReserved EXCEPT ![f] = fileReserved[f] + needed]
+       /\ UNCHANGED <<poolAllocated, poolRented,
+                       filePages, fileAlive,
+                       fileOp, writeTarget, writePreAlloc, writeRange,
+                       lastReadFile, lastReadVal, allocResult, observedFree>>
 
 (* ================================================================
-   SetLength: truncate (write-lock)
+   SetLength: truncate (write-lock on file)
    Free pages beyond new length, return to pool.
-   OverwriteFile is modeled as DoTruncate(f, 0) — truncate to empty.
+   Release excess reservations.
+
+   Can interleave with write phases (see DoExtend comment).
    ================================================================ *)
 DoTruncate(f, newLen) ==
-    /\ fileOp[f] = "idle"
+    /\ fileOp[f] \in {"idle", "w_p1", "w_p2"}
     /\ fileAlive[f]
     /\ newLen >= 0
     /\ newLen < fileLength[f]
@@ -270,16 +386,27 @@ DoTruncate(f, newLen) ==
                         p >= newLen /\ p < fileLength[f] /\ filePages[f][p] # 0})
            newPages == [p \in PageIndices |->
                IF p >= newLen THEN 0 ELSE filePages[f][p]]
+           \* After freeing, count allocated pages in retained range
+           newAllocCount == Cardinality({p \in 0..(newLen - 1) :
+                               newPages[p] # 0})
+           \* Reservations should cover only unallocated pages in retained range
+           newReserved == IF newLen > newAllocCount
+                          THEN newLen - newAllocCount ELSE 0
+           reserveRelease == IF fileReserved[f] > newReserved
+                             THEN fileReserved[f] - newReserved ELSE 0
        IN
        /\ poolRented' = poolRented - freed
        /\ filePages' = [filePages EXCEPT ![f] = newPages]
        /\ fileLength' = [fileLength EXCEPT ![f] = newLen]
+       /\ fileReserved' = [fileReserved EXCEPT ![f] = fileReserved[f] - reserveRelease]
        /\ UNCHANGED <<poolAllocated, fileAlive,
                        fileOp, writeTarget, writePreAlloc, writeRange,
                        lastReadFile, lastReadVal, allocResult, observedFree>>
 
 (* ================================================================
    Delete: dispose file, return all pages (structure-lock + write-lock)
+   Releases all reservations.
+   Only when idle — an open write handle prevents deletion.
    ================================================================ *)
 DoDelete(f) ==
     /\ fileOp[f] = "idle"
@@ -291,9 +418,37 @@ DoDelete(f) ==
        /\ filePages' = [filePages EXCEPT ![f] = clearedPages]
        /\ fileLength' = [fileLength EXCEPT ![f] = 0]
        /\ fileAlive' = [fileAlive EXCEPT ![f] = FALSE]
+       /\ fileReserved' = [fileReserved EXCEPT ![f] = 0]
        /\ UNCHANGED <<poolAllocated,
                        fileOp, writeTarget, writePreAlloc, writeRange,
                        lastReadFile, lastReadVal, allocResult, observedFree>>
+
+(* ================================================================
+   OverwriteFile: truncate to 0, then check allocationSize (write-lock)
+   The allocationSize is a TOCTOU hint — capacity may change before
+   the actual write. The truncation always succeeds; the alloc check
+   is advisory (code returns STATUS_DISK_FULL if exceeded).
+   ================================================================ *)
+DoOverwrite(f, allocSize) ==
+    /\ fileOp[f] = "idle"
+    /\ fileAlive[f]
+    /\ LET freed == Cardinality({p \in PageIndices : filePages[f][p] # 0})
+           clearedPages == [p \in PageIndices |-> 0]
+           \* Free pages after truncation and reservation release
+           newFree == FreePages + freed + fileReserved[f]
+       IN
+       /\ poolRented' = poolRented - freed
+       /\ filePages' = [filePages EXCEPT ![f] = clearedPages]
+       /\ fileLength' = [fileLength EXCEPT ![f] = 0]
+       /\ fileReserved' = [fileReserved EXCEPT ![f] = 0]
+       \* Record allocationSize check result
+       /\ allocResult' = [allocResult EXCEPT ![f] =
+              IF allocSize <= 0 THEN "none"
+              ELSE IF allocSize <= newFree THEN "ok"
+              ELSE "full"]
+       /\ UNCHANGED <<poolAllocated, fileAlive,
+                       fileOp, writeTarget, writePreAlloc, writeRange,
+                       lastReadFile, lastReadVal, observedFree>>
 
 (* ================================================================
    SetAllocationSize: TOCTOU best-effort check (no lock, no state change)
@@ -312,7 +467,7 @@ DoSetAllocSize(f, requestedLen) ==
               ELSE IF additional <= freeNow THEN "ok"
               ELSE "full"]
        /\ UNCHANGED <<poolAllocated, poolRented,
-                       fileLength, filePages, fileAlive,
+                       fileLength, filePages, fileAlive, fileReserved,
                        fileOp, writeTarget, writePreAlloc, writeRange,
                        lastReadFile, lastReadVal, observedFree>>
 
@@ -322,7 +477,7 @@ DoSetAllocSize(f, requestedLen) ==
 DoGetVolumeInfo ==
     /\ observedFree' = FreePages
     /\ UNCHANGED <<poolAllocated, poolRented,
-                    fileLength, filePages, fileAlive,
+                    fileLength, filePages, fileAlive, fileReserved,
                     fileOp, writeTarget, writePreAlloc, writeRange,
                     lastReadFile, lastReadVal, allocResult>>
 
@@ -340,6 +495,7 @@ Next ==
         \/ \E newLen \in 1..MaxPages : DoExtend(f, newLen)
         \/ \E newLen \in 0..(MaxPages - 1) : DoTruncate(f, newLen)
         \/ DoDelete(f)
+        \/ \E allocSize \in 0..MaxPages : DoOverwrite(f, allocSize)
         \/ \E reqLen \in 1..MaxPages : DoSetAllocSize(f, reqLen)
     \/ DoGetVolumeInfo
     \* Stuttering when quiescent
@@ -369,18 +525,29 @@ PoolConsistent ==
 NoPageLeak ==
     TotalFilePages + TotalPreAlloc = poolRented
 
-\* FreeBytes is never polluted by reservations — THE KEY INVARIANT
-\* In the new design, FreePages depends ONLY on poolRented (no reservations).
+\* Committed capacity (rented + reserved) never exceeds total pool.
+\* THE KEY INVARIANT — prevents aggregate file sizes from exceeding capacity.
+CommittedWithinCapacity ==
+    poolRented + TotalReserved <= MaxPages
+
+\* FreePages is consistent and never negative
 FreeBytesAccurate ==
-    FreePages = MaxPages - poolRented
+    FreePages >= 0
 
 \* No single file exceeds total capacity
 SingleFileCap ==
     \A f \in Files : fileLength[f] <= MaxPages
 
+\* Per-file reservations are non-negative and bounded.
+\* When a file has an in-flight write (not idle), Phase 3 may extend
+\* fileLength beyond reservations, so the upper bound only applies at rest.
+ReservationsConsistent ==
+    \A f \in Files :
+        /\ fileReserved[f] >= 0
+        /\ (fileAlive[f] /\ fileOp[f] = "idle") =>
+            fileReserved[f] <= fileLength[f] - FileAllocCount(f)
+
 \* Data integrity: no file ever contains another file's data tag.
-\* Holds in ALL states (not just idle) because only DoWriteP3(f) modifies
-\* filePages[f], and it only writes tag f or keeps existing {0, f} values.
 DataIntegrity ==
     \A f \in Files : fileAlive[f] =>
         \A p \in PageIndices :
@@ -390,16 +557,12 @@ DataIntegrity ==
 ReadConsistent ==
     lastReadFile > 0 => lastReadVal \in {0, lastReadFile}
 
-\* Dead files hold no pages
+\* Dead files hold no pages and no reservations
 DeadFilesClean ==
     \A f \in Files : ~fileAlive[f] =>
         /\ fileLength[f] = 0
+        /\ fileReserved[f] = 0
         /\ \A p \in PageIndices : filePages[f][p] = 0
-
-\* Note: SetAllocSize correctness is self-evident from the action definition
-\* (simple comparison: additional > FreePages → "full"). No invariant needed.
-\* The TOCTOU nature means the result may be stale by the time the write
-\* happens — this is by design and acceptable.
 
 (* ================================================================
    Liveness

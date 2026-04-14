@@ -33,6 +33,9 @@ public sealed class FileNode : IDisposable
 
     public long Size => Content?.Length ?? 0;
 
+    /// <summary>Actual bytes backed by allocated pages. 0 for directories and sparse regions.</summary>
+    public long AllocatedBytes => Content?.AllocatedBytes ?? 0;
+
     private FileNode(string name, FileNodeType nodeType, PagedFileContent? content)
     {
         Name = name;
