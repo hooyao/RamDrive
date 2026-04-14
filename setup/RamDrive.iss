@@ -3,7 +3,7 @@
 ; Supports both portable (green) and Windows Service modes
 
 #define MyAppName      "RamDrive"
-#define MyAppVersion   "0.4.0-beta.1"
+#define MyAppVersion   "0.4.0"
 #define MyAppPublisher "HYProjects"
 #define MyAppExeName   "RamDrive.exe"
 #define MyAppURL       "https://github.com/hooyao/RamDrive"
