@@ -173,8 +173,11 @@ internal sealed unsafe class WinFspRamAdapter : IFileSystem
             return V(FsResult.Error(NtStatus.ObjectNameNotFound));
 
         node.Content.SetLength(0);
-        // allocationSize is a pre-reservation hint — do not set logical file size.
-        // File grows via WriteFile.
+
+        // Early capacity check: if the caller hints at the final file size,
+        // fail fast before the copy begins rather than mid-write.
+        if (allocationSize > 0 && (long)allocationSize > _fs.FreeBytes)
+            return V(FsResult.Error(NtStatus.DiskFull));
 
         if (replaceFileAttributes && fileAttributes != 0)
             node.Attributes = (FileAttributes)fileAttributes;
@@ -445,7 +448,7 @@ internal sealed unsafe class WinFspRamAdapter : IFileSystem
     {
         FileAttributes = (uint)node.Attributes,
         FileSize = (ulong)node.Size,
-        AllocationSize = (ulong)node.Size, // RAM disk — allocation = logical
+        AllocationSize = (ulong)node.AllocatedBytes, // actual pages, not logical size
         CreationTime = ToFileTime(node.CreationTime),
         LastAccessTime = ToFileTime(node.LastAccessTime),
         LastWriteTime = ToFileTime(node.LastWriteTime),
