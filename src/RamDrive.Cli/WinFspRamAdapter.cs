@@ -43,8 +43,15 @@ internal sealed unsafe class WinFspRamAdapter : IFileSystem
     /// <summary>
     /// Default root security descriptor (same as WinFsp memfs):
     /// Owner=Administrators, Group=Administrators, DACL grants full access to SYSTEM, Administrators, Everyone.
+    ///
+    /// <para>The <c>OICI</c> ACE flag = <c>OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE</c>.
+    /// Without it WinFsp's kernel-side <c>FspCreateSecurityDescriptor</c> drops every ACE
+    /// when computing the SD for a newly-created child, leaving children with an empty DACL
+    /// (which the kernel interprets as "deny everyone"). The first symptom is chrome failing
+    /// to reopen its own freshly-created cache files with ACCESS_DENIED. See spec
+    /// <c>default-security-descriptor</c>.</para>
     /// </summary>
-    private const string RootSddl = "O:BAG:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;WD)";
+    private const string RootSddl = "O:BAG:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FA;;;WD)";
 
     private readonly RamFileSystem _fs;
     private readonly RamDriveOptions _options;

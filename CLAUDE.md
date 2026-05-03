@@ -82,7 +82,7 @@ The WinFsp binding is provided by the [`WinFsp.Native`](https://www.nuget.org/pa
 ## WinFsp Notes
 
 - `fileSystemName` must be `"NTFS"` for elevated process compatibility.
-- `GetFileSecurityByName` returns the file's stored security descriptor. Root default: `O:BAG:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;WD)`. `GetFileSecurity`/`SetFileSecurity` implemented via `RawSecurityDescriptor` merge.
+- `GetFileSecurityByName` returns the file's stored security descriptor. Root default: `O:BAG:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FA;;;WD)`. `GetFileSecurity`/`SetFileSecurity` implemented via `RawSecurityDescriptor` merge. The `OICI` ACE flag = `OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE`; without it WinFsp's kernel-side `FspCreateSecurityDescriptor` drops every ACE when computing the SD for a newly-created child, leaving children with an empty DACL and reopen returning `ACCESS_DENIED`. See spec `default-security-descriptor`.
 - `ReadDirectory` uses native buffer with `WinFspFileSystem.AddDirInfo` / `EndDirInfo` — no IEnumerable allocation.
 - `SetMountPointEx` crashes on `"R:\"` (trailing backslash). Mount point format: `"R:"` = `DefineDosDevice` (invisible to disk tools), `"\\.\R:"` = Mount Manager (visible to all apps, requires admin or `MountUseMountmgrFromFSD=1` registry key). `WinFspHostedService` tries `\\.\R:` first, falls back to `R:` on failure.
 - **STATUS_PENDING async**: Must build a fresh stack-allocated `FspTransactRsp` with `Size`/`Kind`/`Hint` fields. Do NOT reuse `OperationContext->Response` — it may be invalidated after returning `STATUS_PENDING`. Save `Request->Hint` before returning, echo it back in the response.

@@ -11,6 +11,10 @@ mono_crash.*
 Procmon64.exe
 procmon_*.pml
 procmon_*.csv
+debug_batch.cmd
+debug_batch.js
+bisect_chrome.js
+repro_chrome_min.js
 *Bench*.png
 imdiskBench.png
 [Dd]ebug/

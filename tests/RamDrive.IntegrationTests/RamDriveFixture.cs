@@ -97,7 +97,7 @@ internal sealed unsafe class TestAdapter : IFileSystem
     private readonly RamDriveOptions _options;
     private FileSystemHost? _host;
 
-    private const string RootSddl = "O:BAG:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;WD)";
+    private const string RootSddl = "O:BAG:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FA;;;WD)";
 
     public TestAdapter(RamFileSystem fs, RamDriveOptions options)
     {
