@@ -64,7 +64,7 @@
 - [x] 6.2 Run `openspec validate fix-leveldb-cache-coherency --strict` and resolve any warnings.
 - [x] 6.3 Commit the binding change in the `winfsp-native` repo with message `feat: add FileSystemHost.Notify for kernel cache invalidation`. Tag `v0.1.2-pre.1`. **(Tagged `v0.1.2-pre.2` — version bumped twice during dev iterations to invalidate nuget local cache.)**
 - [x] 6.4 Commit the RamDrive change with message `fix: invalidate kernel FileInfo cache on path mutations (leveldb/Chromium)`. Reference the change folder in the commit body.
-- [ ] 6.5 Run `/opsx:archive fix-leveldb-cache-coherency` once both commits land and CI is green. **(Ready when user is.)**
+- [x] 6.5 Run `/opsx:archive fix-leveldb-cache-coherency` once both commits land and CI is green. **(Done — archived to `openspec/changes/archive/2026-05-03-fix-leveldb-cache-coherency/`. Specs synced to `openspec/specs/cache-invalidation/` and `openspec/specs/file-info-timeout-config/`.)**
 
 ## 7. Postmortem doc + TLA+ modeling extension
 
