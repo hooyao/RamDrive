@@ -24,12 +24,18 @@
     // Volume label shown in Windows Explorer.
     "VolumeLabel": "RamDrive",
 
-    // Enable Windows kernel-level file data caching (sets WinFsp FileInfoTimeout=MAX).
-    // Improves throughput (~3x) by letting the OS cache manager serve repeated reads
-    // without calling back into user mode.
-    // Warning: under high concurrency, WinFsp's metadata cache may return stale file sizes
-    // because the lazy writer has not yet flushed dirty pages to user mode.
+    // Enable Windows kernel-level file data caching. When true, FileInfoTimeoutMs
+    // (below) controls how long the kernel may serve cached metadata. When false,
+    // the timeout is forced to 0 (no kernel cache, ~3x lower throughput) regardless
+    // of FileInfoTimeoutMs — this is the documented backout switch.
     "EnableKernelCache": true,
+
+    // Lifetime of the WinFsp kernel FileInfo cache, in milliseconds. Default 1000.
+    // The adapter sends FspFileSystemNotify on every path-mutating callback so the
+    // cache is invalidated explicitly; this timeout is defence in depth.
+    //   0           = cache disabled (same effect as EnableKernelCache=false)
+    //   4294967295  = uint.MaxValue, cache effectively permanent (trust notifications only)
+    "FileInfoTimeoutMs": 1000,
 
     // Directories to create automatically after mounting.
     // JSON keys are directory names; nested objects define subdirectories.
