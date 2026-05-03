@@ -6,6 +6,13 @@
 *.sln.docstates
 *.userprefs
 mono_crash.*
+
+# Diagnostic artefacts collected during ad-hoc debugging — kept locally, not checked in.
+Procmon64.exe
+procmon_*.pml
+procmon_*.csv
+*Bench*.png
+imdiskBench.png
 [Dd]ebug/
 [Dd]ebugPublic/
 [Rr]elease/

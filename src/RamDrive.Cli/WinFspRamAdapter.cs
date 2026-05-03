@@ -16,6 +16,26 @@ namespace RamDrive.Cli;
 /// Design: zero managed heap allocation on hot path (Read/Write/GetFileInfo etc).
 /// All ValueTask returns are synchronous-completed (no Task boxing).
 /// FileNode is cached in <see cref="FileOperationInfo.Context"/>.
+///
+/// <para>
+/// <b>Cache-invalidation matrix</b> — every path-mutating callback below sends an
+/// <c>FspFileSystemNotify</c> via <see cref="FileSystemHost.Notify(uint, uint, string)"/>
+/// after the user-mode mutation commits. This keeps the WinFsp kernel <c>FileInfo</c>
+/// cache coherent with <see cref="RamFileSystem"/> state, even when
+/// <see cref="RamDriveOptions.FileInfoTimeoutMs"/> is large or
+/// <see cref="uint.MaxValue"/>. See <c>specs/cache-invalidation/spec.md</c>.
+/// </para>
+/// <list type="table">
+///   <listheader><term>Callback</term><description>Filter / Action</description></listheader>
+///   <item><term>CreateFile (file)</term><description>ChangeFileName / ActionAdded</description></item>
+///   <item><term>CreateFile (dir)</term><description>ChangeDirName / ActionAdded</description></item>
+///   <item><term>OverwriteFile</term><description>ChangeSize|ChangeLastWrite / ActionModified</description></item>
+///   <item><term>SetFileSize (logical)</term><description>ChangeSize|ChangeLastWrite / ActionModified</description></item>
+///   <item><term>SetFileAttributes</term><description>ChangeAttributes|ChangeLastWrite / ActionModified</description></item>
+///   <item><term>MoveFile</term><description>(old) ChangeFileName/ActionRenamedOldName + (new) ChangeFileName/ActionRenamedNewName</description></item>
+///   <item><term>Cleanup(Delete) (file)</term><description>ChangeFileName / ActionRemoved</description></item>
+///   <item><term>Cleanup(Delete) (dir)</term><description>ChangeDirName / ActionRemoved</description></item>
+/// </list>
 /// </summary>
 [SupportedOSPlatform("windows")]
 internal sealed unsafe class WinFspRamAdapter : IFileSystem
@@ -29,6 +49,7 @@ internal sealed unsafe class WinFspRamAdapter : IFileSystem
     private readonly RamFileSystem _fs;
     private readonly RamDriveOptions _options;
     private readonly ILogger<WinFspRamAdapter> _logger;
+    private FileSystemHost? _host;
 
     public WinFspRamAdapter(RamFileSystem fs, IOptions<RamDriveOptions> options, ILogger<WinFspRamAdapter> logger)
     {
@@ -58,8 +79,9 @@ internal sealed unsafe class WinFspRamAdapter : IFileSystem
         host.SectorSize = 4096;
         host.SectorsPerAllocationUnit = 1;
         host.MaxComponentLength = 255;
-        if (_options.EnableKernelCache)
-            host.FileInfoTimeout = unchecked((uint)(-1));
+        // Notifications keep the kernel cache coherent; FileInfoTimeoutMs is defence in depth.
+        // EnableKernelCache=false forces 0 (no cache) regardless of FileInfoTimeoutMs — backout switch.
+        host.FileInfoTimeout = _options.EnableKernelCache ? _options.FileInfoTimeoutMs : 0u;
         host.CasePreservedNames = true;
         host.UnicodeOnDisk = true;
         host.PersistentAcls = true;
@@ -70,6 +92,7 @@ internal sealed unsafe class WinFspRamAdapter : IFileSystem
 
     public int Mounted(FileSystemHost host)
     {
+        _host = host;
         _logger.LogInformation("Drive mounted at {MountPoint}", host.MountPoint);
         return NtStatus.Success;
     }
@@ -128,6 +151,9 @@ internal sealed unsafe class WinFspRamAdapter : IFileSystem
 
             info.Context = dir;
             info.IsDirectory = true;
+            // Cache invalidation: defeat negative cache for callers that probed this name
+            // before it existed (leveldb, SQLite, etc. routinely do this).
+            Notify(FileNotify.ChangeDirName, FileNotify.ActionAdded, fileName);
             return V(new CreateResult(NtStatus.Success, MakeFileInfo(dir)));
         }
 
@@ -148,6 +174,8 @@ internal sealed unsafe class WinFspRamAdapter : IFileSystem
 
         info.Context = file;
         info.IsDirectory = false;
+        // Cache invalidation: see comment above for the directory branch.
+        Notify(FileNotify.ChangeFileName, FileNotify.ActionAdded, fileName);
         return V(new CreateResult(NtStatus.Success, MakeFileInfo(file)));
     }
 
@@ -185,6 +213,9 @@ internal sealed unsafe class WinFspRamAdapter : IFileSystem
             node.Attributes |= (FileAttributes)fileAttributes;
 
         node.LastWriteTime = DateTime.UtcNow;
+        // Cache invalidation: size went to 0; subsequent reads must not see the pre-overwrite cached size.
+        if (info.FileName is { } path)
+            Notify(FileNotify.ChangeSize | FileNotify.ChangeLastWrite, FileNotify.ActionModified, path);
         return V(FsResult.Success(MakeFileInfo(node)));
     }
 
@@ -275,6 +306,7 @@ internal sealed unsafe class WinFspRamAdapter : IFileSystem
         if (lastWriteTime != 0) node.LastWriteTime = DateTime.FromFileTimeUtc((long)lastWriteTime);
         // changeTime: we don't track separately
 
+        Notify(FileNotify.ChangeAttributes | FileNotify.ChangeLastWrite, FileNotify.ActionModified, fileName);
         return V(FsResult.Success(MakeFileInfo(node)));
     }
 
@@ -301,6 +333,7 @@ internal sealed unsafe class WinFspRamAdapter : IFileSystem
             return V(FsResult.Error(NtStatus.DiskFull));
 
         node.LastWriteTime = DateTime.UtcNow;
+        Notify(FileNotify.ChangeSize | FileNotify.ChangeLastWrite, FileNotify.ActionModified, fileName);
         return V(FsResult.Success(MakeFileInfo(node)));
     }
 
@@ -366,6 +399,12 @@ internal sealed unsafe class WinFspRamAdapter : IFileSystem
             // Update cached node — name changed
             var node = Node(info);
             if (node != null) info.Context = node; // still valid reference
+            // Cache invalidation MUST happen after the lock is released (Move returned).
+            // Without ActionRenamedNewName the kernel's negative cache for newFileName
+            // (populated by leveldb's pre-rename existence probe) survives the rename and
+            // a subsequent ReadFile returns 0 bytes — see fix-leveldb-cache-coherency.
+            Notify(FileNotify.ChangeFileName, FileNotify.ActionRenamedOldName, fileName);
+            Notify(FileNotify.ChangeFileName, FileNotify.ActionRenamedNewName, newFileName);
             return V(NtStatus.Success);
         }
         return V(NtStatus.ObjectNameCollision);
@@ -379,7 +418,11 @@ internal sealed unsafe class WinFspRamAdapter : IFileSystem
     {
         if (flags.HasFlag(CleanupFlags.Delete) && fileName != null)
         {
+            // Capture IsDirectory BEFORE Delete disposes the node.
+            bool wasDir = info.IsDirectory;
             _fs.Delete(fileName);
+            Notify(wasDir ? FileNotify.ChangeDirName : FileNotify.ChangeFileName,
+                FileNotify.ActionRemoved, fileName);
         }
 
         var node = Node(info);
@@ -442,6 +485,36 @@ internal sealed unsafe class WinFspRamAdapter : IFileSystem
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private static FileNode? Node(FileOperationInfo info)
         => info.Context as FileNode;
+
+    /// <summary>
+    /// Send an FspFileSystemNotify to invalidate the WinFsp kernel FileInfo cache for
+    /// <paramref name="path"/>. Failures are intentionally swallowed: the originating IRP
+    /// MUST succeed even if cache invalidation fails — the user-mode mutation already
+    /// committed and stale cache is bounded by <c>FileInfoTimeoutMs</c>.
+    /// Per <c>specs/cache-invalidation/spec.md</c>.
+    ///
+    /// <para>The notification is dispatched on a thread-pool worker rather than synchronously
+    /// from the WinFsp dispatcher thread. <c>FspFsctlNotify</c> is a kernel IOCTL that can
+    /// block on rename-in-progress; if a dispatcher thread is blocked in <c>Notify</c> while
+    /// the IRP that would unblock it is waiting for that same dispatcher thread to drain,
+    /// the dispatcher pool deadlocks. The off-thread dispatch keeps the dispatcher free at
+    /// the cost of fire-and-forget ordering — acceptable because the kernel will revalidate
+    /// any cached entry on the next open after invalidation, and the matrix is path-scoped.</para>
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private void Notify(uint filter, uint action, string path)
+    {
+        var host = _host;
+        if (host == null) return;
+        ThreadPool.UnsafeQueueUserWorkItem(static state =>
+        {
+            var (host, filter, action, path, logger) = state;
+            int status = host.Notify(filter, action, path);
+            if (status < 0 && logger.IsEnabled(LogLevel.Trace))
+                logger.LogTrace("FspFileSystemNotify({Path}, filter=0x{Filter:X}, action={Action}) returned 0x{Status:X8}",
+                    path, filter, action, status);
+        }, (host, filter, action, path, _logger), preferLocal: false);
+    }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private static FspFileInfo MakeFileInfo(FileNode node) => new()

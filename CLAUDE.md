@@ -261,5 +261,6 @@ All settings in `appsettings.jsonc` under `"RamDrive"` section, overridable via 
 | PageSizeKb | 64 | Page granularity (try 256 for large-file workloads) |
 | PreAllocate | false | true = allocate all memory at startup |
 | VolumeLabel | RamDrive | Explorer display name |
-| EnableKernelCache | true | Kernel page cache (~3x throughput). Uses WinFsp `FileInfoTimeout=MAX`. |
+| EnableKernelCache | true | Master switch for the WinFsp kernel `FileInfo` cache. `false` forces `FileInfoTimeoutMs` to `0` regardless of its configured value (backout switch; ~3× lower throughput). |
+| FileInfoTimeoutMs | 1000 | Kernel `FileInfo` cache lifetime (ms). The adapter invalidates the cache explicitly via `FspFileSystemNotify` on every path-mutating callback (see `WinFspRamAdapter.cs` notification matrix); this timeout is defence in depth. `0` disables the cache; `uint.MaxValue` makes it permanent (trust notifications only — the integration test fixture pins this value to catch regressions). |
 | InitialDirectories | `{}` | Tree of directories to create on mount (e.g. `{ "Temp": {} }`) |
