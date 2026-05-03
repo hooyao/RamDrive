@@ -16,6 +16,7 @@ namespace RamDrive.IntegrationTests;
 /// this class is a static-content guard with no FS dependency, so it lives in this assembly
 /// only because the constant is internal-private to the consuming projects.</para>
 /// </summary>
+[Collection("RamDrive")]
 [SupportedOSPlatform("windows")]
 public class RootSddlTests
 {
