@@ -276,6 +276,15 @@ invalidation lands.
 
 ### 9.1 Known follow-up: a SEPARATE pre-existing pipe-mode crash
 
+> **Update (2026-05-03)**: A second, *separate* bug was identified during the
+> diagnostic of this one — root SDDL `(A;;FA;;;...)` lacked `OI/CI` flags so
+> newly-created files inherited an empty DACL, producing `ACCESS_DENIED` on
+> reopen. That manifested as Chromium's "Profile error occurred" dialog and
+> the `top_sites_backend / login_database / disk_cache` failures listed
+> below. Fixed by openspec change `fix-acl-inheritance`. The
+> `--remote-debugging-pipe` `STATUS_BREAKPOINT` described in the rest of this
+> section is **independent** of the ACL bug and remains open.
+
 After landing the leveldb fix and verifying it works (`CURRENT` ends with
 `\n` correctly on disk, integration tests pass at `FileInfoTimeout=uint.MaxValue`),
 manual end-to-end testing surfaced a **different** bug that was always there
