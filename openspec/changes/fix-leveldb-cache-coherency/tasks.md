@@ -62,9 +62,9 @@
 
 - [x] 6.1 Delete or `.gitignore` the diagnostic artefacts at the repo root: `repro_chrome.js`, `procmon_chrome.pml`, `procmon_chrome.csv`, `Procmon64.exe`, `imdiskBench.png`, `winfspbench.png`/`winfspBench[2-5].png`. Keep `tla/` and `winfsp-native/` (those are real code). **(Done via .gitignore; `repro_chrome.js` is intentionally kept and referenced by the postmortem doc.)**
 - [x] 6.2 Run `openspec validate fix-leveldb-cache-coherency --strict` and resolve any warnings.
-- [ ] 6.3 Commit the binding change in the `winfsp-native` repo with message `feat: add FileSystemHost.Notify for kernel cache invalidation`. Tag `v0.1.2-pre.1`.
-- [ ] 6.4 Commit the RamDrive change with message `fix: invalidate kernel FileInfo cache on path mutations (leveldb/Chromium)`. Reference the change folder in the commit body.
-- [ ] 6.5 Run `/opsx:archive fix-leveldb-cache-coherency` once both commits land and CI is green.
+- [x] 6.3 Commit the binding change in the `winfsp-native` repo with message `feat: add FileSystemHost.Notify for kernel cache invalidation`. Tag `v0.1.2-pre.1`. **(Tagged `v0.1.2-pre.2` — version bumped twice during dev iterations to invalidate nuget local cache.)**
+- [x] 6.4 Commit the RamDrive change with message `fix: invalidate kernel FileInfo cache on path mutations (leveldb/Chromium)`. Reference the change folder in the commit body.
+- [ ] 6.5 Run `/opsx:archive fix-leveldb-cache-coherency` once both commits land and CI is green. **(Ready when user is.)**
 
 ## 7. Postmortem doc + TLA+ modeling extension
 
