@@ -114,7 +114,17 @@ internal sealed unsafe class TestAdapter : IFileSystem
 
     [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
     private void Notify(uint filter, uint action, string path)
-        => _host?.Notify(filter, action, path);
+    {
+        // Off-thread, fire-and-forget — see WinFspRamAdapter.Notify for rationale
+        // (avoids dispatcher-pool deadlock under concurrent dir delete).
+        var host = _host;
+        if (host == null) return;
+        ThreadPool.UnsafeQueueUserWorkItem(static state =>
+        {
+            var (host, filter, action, path) = state;
+            host.Notify(filter, action, path);
+        }, (host, filter, action, path), preferLocal: false);
+    }
 
     public int Init(FileSystemHost host)
     {

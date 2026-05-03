@@ -492,15 +492,28 @@ internal sealed unsafe class WinFspRamAdapter : IFileSystem
     /// MUST succeed even if cache invalidation fails — the user-mode mutation already
     /// committed and stale cache is bounded by <c>FileInfoTimeoutMs</c>.
     /// Per <c>specs/cache-invalidation/spec.md</c>.
+    ///
+    /// <para>The notification is dispatched on a thread-pool worker rather than synchronously
+    /// from the WinFsp dispatcher thread. <c>FspFsctlNotify</c> is a kernel IOCTL that can
+    /// block on rename-in-progress; if a dispatcher thread is blocked in <c>Notify</c> while
+    /// the IRP that would unblock it is waiting for that same dispatcher thread to drain,
+    /// the dispatcher pool deadlocks. The off-thread dispatch keeps the dispatcher free at
+    /// the cost of fire-and-forget ordering — acceptable because the kernel will revalidate
+    /// any cached entry on the next open after invalidation, and the matrix is path-scoped.</para>
     /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private void Notify(uint filter, uint action, string path)
     {
-        if (_host == null) return;
-        int status = _host.Notify(filter, action, path);
-        if (status < 0 && _logger.IsEnabled(LogLevel.Trace))
-            _logger.LogTrace("FspFileSystemNotify({Path}, filter=0x{Filter:X}, action={Action}) returned 0x{Status:X8}",
-                path, filter, action, status);
+        var host = _host;
+        if (host == null) return;
+        ThreadPool.UnsafeQueueUserWorkItem(static state =>
+        {
+            var (host, filter, action, path, logger) = state;
+            int status = host.Notify(filter, action, path);
+            if (status < 0 && logger.IsEnabled(LogLevel.Trace))
+                logger.LogTrace("FspFileSystemNotify({Path}, filter=0x{Filter:X}, action={Action}) returned 0x{Status:X8}",
+                    path, filter, action, status);
+        }, (host, filter, action, path, _logger), preferLocal: false);
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]

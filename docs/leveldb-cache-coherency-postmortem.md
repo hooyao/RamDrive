@@ -250,6 +250,30 @@ Regression test: `tests/RamDrive.IntegrationTests/LevelDbReproTests.cs`. Three
 test methods (basic, mixed-case rename, default-timeout fixture) cover the
 matrix.
 
+### 9.0.1 Notify must dispatch off the WinFsp dispatcher thread
+
+After the initial fix passed locally, the RamDrive PR's CI hung on
+`TortureTests.DirectoryTreeStress` (5 concurrent threads creating + recursively
+deleting nested directory trees). The same suite passed locally on a 32-core
+machine; the GitHub `windows-latest` runner has fewer cores, exposing a
+**dispatcher-pool deadlock**:
+
+- `Cleanup(Delete)` for a directory ran on a WinFsp dispatcher thread.
+- The adapter called `FspFileSystemNotify` synchronously from inside that callback.
+- `FspFsctlNotify` is a kernel IOCTL that can block on rename-in-progress.
+- Concurrent recursive deletes on sibling directories saturated the dispatcher
+  pool — every dispatcher thread was sitting in `Notify` waiting for kernel
+  state that another (already-blocked) dispatcher would have released.
+
+Fix: `WinFspRamAdapter.Notify` and the `TestAdapter.Notify` were changed to
+fire-and-forget via `ThreadPool.UnsafeQueueUserWorkItem(..., preferLocal: false)`.
+The `Notify` returns immediately; the IOCTL runs on a worker thread that is
+not in the WinFsp dispatcher pool. Acceptable trade-off: notifications can be
+reordered relative to the IRP that triggered them, but the matrix is
+path-scoped and the kernel revalidates on the next open after invalidation, so
+ordering does not affect correctness — only when (in microseconds) the
+invalidation lands.
+
 ### 9.1 Known follow-up: a SEPARATE pre-existing pipe-mode crash
 
 After landing the leveldb fix and verifying it works (`CURRENT` ends with
