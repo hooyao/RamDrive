@@ -24,5 +24,5 @@
 
 - [x] 4.1 Run `openspec validate fix-acl-inheritance --strict`.
 - [x] 4.2 Create feature branch `fix/acl-inheritance` from `origin/main`. Move the local working-tree edits onto the branch (the SDDL change in two files is already done locally; commit it together with the new tests and the spec/proposal/design/tasks files).
-- [ ] 4.3 Push branch, open PR with title `Fix ACL inheritance: newly-created files reopenable by creator`. PR body links to the procmon-evidence rows in `docs/leveldb-cache-coherency-postmortem.md` once that doc note is added.
-- [ ] 4.4 After CI green and merge, archive the change with `/opsx:archive fix-acl-inheritance` and sync the new `default-security-descriptor` spec into `openspec/specs/`.
+- [x] 4.3 Push branch, open PR with title `Fix ACL inheritance: newly-created files reopenable by creator`. PR body links to the procmon-evidence rows in `docs/leveldb-cache-coherency-postmortem.md` once that doc note is added. **(PR #10 merged as e5bc2e1.)**
+- [x] 4.4 After CI green and merge, archive the change with `/opsx:archive fix-acl-inheritance` and sync the new `default-security-descriptor` spec into `openspec/specs/`. **(In progress — spec sync + archive happening now.)**
