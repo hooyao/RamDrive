@@ -201,6 +201,8 @@ end;
 function NextButtonClick(CurPageID: Integer): Boolean;
 var
   CapVal: Integer;
+  TargetLetter: Char;
+  TempPath: string;
 begin
   Result := True;
   if CurPageID = ConfigPage.ID then
@@ -218,6 +220,31 @@ begin
     if CapVal < 16 then
     begin
       MsgBox('Capacity must be at least 16 MB.', mbError, MB_OK);
+      Result := False;
+      Exit;
+    end;
+
+    // Refuse to install if the installer's temp directory ({tmp}) is on the
+    // same drive the user just chose for the RAM disk. Installing would stop
+    // the existing RamDrive service to swap binaries; that unmounts the drive
+    // and erases {tmp} mid-install, leaving the system in a broken state
+    // (service stopped, new exe not in place, installer crashed).
+    TargetLetter := UpCase(DriveCombo.Text[1]);
+    TempPath := ExpandConstant('{tmp}');
+    if (Length(TempPath) >= 2) and (UpCase(TempPath[1]) = TargetLetter) and (TempPath[2] = ':') then
+    begin
+      MsgBox(
+        'The installer''s temporary directory is on drive ' + TargetLetter + ':' + #13#10 +
+        '(' + TempPath + ')' + #13#10 + #13#10 +
+        'This is the same drive you selected for the RAM disk. The installer ' +
+        'must stop the existing RamDrive service to swap binaries; doing so ' +
+        'unmounts ' + TargetLetter + ': and would delete the installer''s own ' +
+        'working files mid-install.' + #13#10 + #13#10 +
+        'Re-run the installer from a command prompt with /T= pointing at a ' +
+        'directory NOT on the RAM disk, e.g.:' + #13#10 + #13#10 +
+        '    ' + ExpandConstant('{srcexe}') + ' /T=C:\Windows\Temp' + #13#10 + #13#10 +
+        '(or any directory on a different physical drive).',
+        mbError, MB_OK);
       Result := False;
       Exit;
     end;
