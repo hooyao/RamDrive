@@ -4,10 +4,10 @@ using System.Security.AccessControl;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using RamDrive.Core.Configuration;
-using RamDrive.Core.FileSystem;
+using RamDrive.Core.Diagnostics;
 using WinFsp.Native;
 
-namespace RamDrive.Cli;
+namespace RamDrive.Core.FileSystem;
 
 /// <summary>
 /// WinFsp adapter backed by RamFileSystem. Implements <see cref="IFileSystem"/>
@@ -38,7 +38,7 @@ namespace RamDrive.Cli;
 /// </list>
 /// </summary>
 [SupportedOSPlatform("windows")]
-internal sealed unsafe class WinFspRamAdapter : IFileSystem
+public sealed unsafe class WinFspRamAdapter : IFileSystem
 {
     /// <summary>
     /// Default root security descriptor (same as WinFsp memfs):
@@ -131,11 +131,13 @@ internal sealed unsafe class WinFspRamAdapter : IFileSystem
         if (node == null)
         {
             fileAttributes = 0;
+            FsTracer.Trace("GetFileSecurityByName-NF", fileName);
             return NtStatus.ObjectNameNotFound;
         }
 
         fileAttributes = (uint)node.Attributes;
         securityDescriptor = node.SecurityDescriptor;
+        FsTracer.Trace("GetFileSecurityByName", fileName, $"attr=0x{fileAttributes:X}");
         return NtStatus.Success;
     }
 
@@ -154,10 +156,14 @@ internal sealed unsafe class WinFspRamAdapter : IFileSystem
         {
             var dir = _fs.CreateDirectory(fileName, securityDescriptor);
             if (dir == null)
+            {
+                FsTracer.Trace("CreateFile-Dir-Coll", fileName);
                 return V(CreateResult.Error(NtStatus.ObjectNameCollision));
+            }
 
             info.Context = dir;
             info.IsDirectory = true;
+            FsTracer.Trace("CreateFile-Dir", fileName, $"co=0x{createOptions:X} ga=0x{grantedAccess:X}");
             // Cache invalidation: defeat negative cache for callers that probed this name
             // before it existed (leveldb, SQLite, etc. routinely do this).
             Notify(FileNotify.ChangeDirName, FileNotify.ActionAdded, fileName);
@@ -169,18 +175,25 @@ internal sealed unsafe class WinFspRamAdapter : IFileSystem
         {
             // Distinguish: parent not found vs name collision
             if (_fs.FindNode(fileName) != null)
+            {
+                FsTracer.Trace("CreateFile-Coll", fileName);
                 return V(CreateResult.Error(NtStatus.ObjectNameCollision));
+            }
+            FsTracer.Trace("CreateFile-PathNF", fileName);
             return V(CreateResult.Error(NtStatus.ObjectPathNotFound));
         }
 
         // allocationSize is a hint for pre-allocation, not logical file size.
         // Do not set _length — the file starts at size 0 and grows via WriteFile.
 
-        if (fileAttributes != 0)
-            file.Attributes = (FileAttributes)fileAttributes;
+        // NTFS / memfs.cpp convention: every newly-created file gets FILE_ATTRIBUTE_ARCHIVE.
+        // Returning the right attributes from CreateFile keeps the WinFsp kernel cache
+        // consistent with both NTFS semantics and the Diagnostics.MemfsReference oracle.
+        file.Attributes = (FileAttributes)fileAttributes | FileAttributes.Archive;
 
         info.Context = file;
         info.IsDirectory = false;
+        FsTracer.Trace("CreateFile", fileName, $"co=0x{createOptions:X} ga=0x{grantedAccess:X} alloc={allocationSize}");
         // Cache invalidation: see comment above for the directory branch.
         Notify(FileNotify.ChangeFileName, FileNotify.ActionAdded, fileName);
         return V(new CreateResult(NtStatus.Success, MakeFileInfo(file)));
@@ -192,10 +205,14 @@ internal sealed unsafe class WinFspRamAdapter : IFileSystem
     {
         var node = _fs.FindNode(fileName);
         if (node == null)
+        {
+            FsTracer.Trace("OpenFile-NF", fileName, $"co=0x{createOptions:X} ga=0x{grantedAccess:X}");
             return V(CreateResult.Error(NtStatus.ObjectNameNotFound));
+        }
 
         info.Context = node;
         info.IsDirectory = node.IsDirectory;
+        FsTracer.Trace("OpenFile", fileName, $"co=0x{createOptions:X} ga=0x{grantedAccess:X} size={node.Size}");
         return V(new CreateResult(NtStatus.Success, MakeFileInfo(node)));
     }
 
@@ -207,6 +224,7 @@ internal sealed unsafe class WinFspRamAdapter : IFileSystem
         if (node?.Content == null)
             return V(FsResult.Error(NtStatus.ObjectNameNotFound));
 
+        long sizeBefore = node.Content.Length;
         node.Content.SetLength(0);
 
         // Early capacity check: if the caller hints at the final file size,
@@ -222,7 +240,10 @@ internal sealed unsafe class WinFspRamAdapter : IFileSystem
         node.LastWriteTime = DateTime.UtcNow;
         // Cache invalidation: size went to 0; subsequent reads must not see the pre-overwrite cached size.
         if (info.FileName is { } path)
+        {
+            FsTracer.Trace("OverwriteFile", path, $"sizeBefore={sizeBefore} alloc={allocationSize}");
             Notify(FileNotify.ChangeSize | FileNotify.ChangeLastWrite, FileNotify.ActionModified, path);
+        }
         return V(FsResult.Success(MakeFileInfo(node)));
     }
 
@@ -240,11 +261,15 @@ internal sealed unsafe class WinFspRamAdapter : IFileSystem
 
         long fileLength = node.Content.Length;
         if ((long)offset >= fileLength)
+        {
+            FsTracer.Trace("ReadFile-EOF", fileName, $"off={offset} buf={buffer.Length} len={fileLength}");
             return V(ReadResult.EndOfFile());
+        }
 
         int toRead = (int)Math.Min(buffer.Length, fileLength - (long)offset);
         int bytesRead = node.Content.Read((long)offset, buffer.Span[..toRead]);
         node.LastAccessTime = DateTime.UtcNow;
+        FsTracer.Trace("ReadFile", fileName, $"off={offset} buf={buffer.Length} read={bytesRead} len={fileLength}");
         return V(ReadResult.Success((uint)bytesRead));
     }
 
@@ -264,21 +289,41 @@ internal sealed unsafe class WinFspRamAdapter : IFileSystem
         {
             long fileLength = node.Content.Length;
             if (writeOffset >= fileLength)
+            {
+                FsTracer.Trace("WriteFile-NOOP", fileName, $"cio=1 wo={writeOffset} fl={fileLength} buf={buffer.Length}");
                 return V(WriteResult.Success(0, MakeFileInfo(node)));
+            }
             writeLength = (int)Math.Min(writeLength, fileLength - writeOffset);
         }
 
+        long lengthBefore = node.Content.Length;  // for trace only
         int written = node.Content.Write(writeOffset, buffer.Span[..writeLength]);
         if (written < 0)
+        {
+            FsTracer.Trace("WriteFile-FULL", fileName, $"wo={writeOffset} buf={buffer.Length}");
             return V(WriteResult.Error(NtStatus.DiskFull));
+        }
 
         node.LastWriteTime = DateTime.UtcNow;
+
+        FsTracer.Trace("WriteFile", fileName,
+            $"cio={(constrainedIo ? 1 : 0)} wteof={(writeToEndOfFile ? 1 : 0)} off={offset} wo={writeOffset} buf={buffer.Length} written={written} lenBefore={lengthBefore} lenAfter={node.Content.Length}");
+
         return V(WriteResult.Success((uint)written, MakeFileInfo(node)));
     }
 
     public ValueTask<FsResult> FlushFileBuffers(
         string? fileName, FileOperationInfo info, CancellationToken ct)
-        => V(FsResult.Success());
+    {
+        if (fileName != null) FsTracer.Trace("FlushFileBuffers", fileName);
+        // Must return FileInfo of the open file (when present). The kernel uses the
+        // returned FileInfo to update its Cc-cache view of FileSize/AllocationSize.
+        // Returning an empty FspFileInfo (all zeros) makes the kernel think FileSize=0
+        // and invalidates cached pages — chrome reads zeros from a file it just wrote
+        // and DCHECK fires (STATUS_BREAKPOINT). Root cause of the chrome+cache-on bug.
+        var node = Node(info);
+        return V(node != null ? FsResult.Success(MakeFileInfo(node)) : FsResult.Success());
+    }
 
     // ═══════════════════════════════════════════
     //  Metadata
@@ -291,6 +336,7 @@ internal sealed unsafe class WinFspRamAdapter : IFileSystem
         if (node == null)
             return V(FsResult.Error(NtStatus.ObjectNameNotFound));
 
+        FsTracer.Trace("GetFileInformation", fileName, $"size={node.Size}");
         return V(FsResult.Success(MakeFileInfo(node)));
     }
 
@@ -314,6 +360,7 @@ internal sealed unsafe class WinFspRamAdapter : IFileSystem
         // changeTime: we don't track separately
 
         Notify(FileNotify.ChangeAttributes | FileNotify.ChangeLastWrite, FileNotify.ActionModified, fileName);
+        FsTracer.Trace("SetFileAttributes", fileName, $"attr=0x{fileAttributes:X}");
         return V(FsResult.Success(MakeFileInfo(node)));
     }
 
@@ -333,13 +380,16 @@ internal sealed unsafe class WinFspRamAdapter : IFileSystem
             long additional = (long)newSize - node.Size;
             if (additional > 0 && additional > _fs.FreeBytes)
                 return V(FsResult.Error(NtStatus.DiskFull));
+            FsTracer.Trace("SetFileSize-Alloc", fileName, $"newSize={newSize} curSize={node.Size}");
             return V(FsResult.Success(MakeFileInfo(node)));
         }
 
+        long sizeBefore = node.Content.Length;
         if (!node.Content.SetLength((long)newSize))
             return V(FsResult.Error(NtStatus.DiskFull));
 
         node.LastWriteTime = DateTime.UtcNow;
+        FsTracer.Trace("SetFileSize", fileName, $"newSize={newSize} sizeBefore={sizeBefore}");
         Notify(FileNotify.ChangeSize | FileNotify.ChangeLastWrite, FileNotify.ActionModified, fileName);
         return V(FsResult.Success(MakeFileInfo(node)));
     }
@@ -392,8 +442,12 @@ internal sealed unsafe class WinFspRamAdapter : IFileSystem
             return V(NtStatus.ObjectNameNotFound);
 
         if (node.IsDirectory && node.Children!.Count > 0)
+        {
+            FsTracer.Trace("CanDelete-NotEmpty", fileName, $"children={node.Children!.Count}");
             return V(NtStatus.DirectoryNotEmpty);
+        }
 
+        FsTracer.Trace("CanDelete", fileName);
         return V(NtStatus.Success);
     }
 
@@ -406,6 +460,7 @@ internal sealed unsafe class WinFspRamAdapter : IFileSystem
             // Update cached node — name changed
             var node = Node(info);
             if (node != null) info.Context = node; // still valid reference
+            FsTracer.Trace("MoveFile", fileName, $"=> {newFileName} replace={replaceIfExists}");
             // Cache invalidation MUST happen after the lock is released (Move returned).
             // Without ActionRenamedNewName the kernel's negative cache for newFileName
             // (populated by leveldb's pre-rename existence probe) survives the rename and
@@ -414,6 +469,7 @@ internal sealed unsafe class WinFspRamAdapter : IFileSystem
             Notify(FileNotify.ChangeFileName, FileNotify.ActionRenamedNewName, newFileName);
             return V(NtStatus.Success);
         }
+        FsTracer.Trace("MoveFile-Coll", fileName, $"=> {newFileName}");
         return V(NtStatus.ObjectNameCollision);
     }
 
@@ -428,8 +484,13 @@ internal sealed unsafe class WinFspRamAdapter : IFileSystem
             // Capture IsDirectory BEFORE Delete disposes the node.
             bool wasDir = info.IsDirectory;
             _fs.Delete(fileName);
+            FsTracer.Trace("Cleanup-Delete", fileName, $"isDir={wasDir} flags=0x{(uint)flags:X}");
             Notify(wasDir ? FileNotify.ChangeDirName : FileNotify.ChangeFileName,
                 FileNotify.ActionRemoved, fileName);
+        }
+        else if (fileName != null)
+        {
+            FsTracer.Trace("Cleanup", fileName, $"flags=0x{(uint)flags:X}");
         }
 
         var node = Node(info);
@@ -445,6 +506,7 @@ internal sealed unsafe class WinFspRamAdapter : IFileSystem
 
     public void Close(FileOperationInfo info)
     {
+        if (info.FileName is { } path) FsTracer.Trace("Close", path);
         info.Context = null;
     }
 
@@ -511,12 +573,14 @@ internal sealed unsafe class WinFspRamAdapter : IFileSystem
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private void Notify(uint filter, uint action, string path)
     {
+        if (!_options.EnableNotifications) return;
         var host = _host;
         if (host == null) return;
         ThreadPool.UnsafeQueueUserWorkItem(static state =>
         {
             var (host, filter, action, path, logger) = state;
             int status = host.Notify(filter, action, path);
+            FsTracer.Trace("Notify", path, $"filter=0x{filter:X} action={action} status=0x{status:X8}");
             if (status < 0 && logger.IsEnabled(LogLevel.Trace))
                 logger.LogTrace("FspFileSystemNotify({Path}, filter=0x{Filter:X}, action={Action}) returned 0x{Status:X8}",
                     path, filter, action, status);

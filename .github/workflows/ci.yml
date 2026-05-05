@@ -81,6 +81,22 @@ jobs:
           }
           if ($failed) { exit 1 }
 
+      - name: Test (DifferentialChecker)
+        shell: pwsh
+        env:
+          RAMDRIVE_DIFF: "1"
+        run: |
+          # Re-run integration tests with the production WinFspRamAdapter wrapped in
+          # DifferentialAdapter against MemfsReferenceFs. Throws on the first
+          # behavioural divergence between the two file systems. Excludes ChaosTests
+          # (long random-fuzz; CI smoke covers the structured cases).
+          dotnet test tests/RamDrive.IntegrationTests/RamDrive.IntegrationTests.csproj `
+            -c Release --no-build --verbosity normal `
+            --filter "FullyQualifiedName!~ChaosTests" `
+            --logger "trx;LogFileName=RamDrive.IntegrationTests.Diff.trx" `
+            --results-directory ./TestResults
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+
       - name: Test report
         uses: dorny/test-reporter@v2
         if: always()

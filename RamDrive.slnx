@@ -2,6 +2,10 @@
   <Folder Name="/src/">
     <Project Path="src/RamDrive.Core/RamDrive.Core.csproj" />
     <Project Path="src/RamDrive.Cli/RamDrive.Cli.csproj" />
+    <Project Path="src/RamDrive.Diagnostics.MemfsReference/RamDrive.Diagnostics.MemfsReference.csproj" />
+    <Project Path="src/RamDrive.Diagnostics.DifferentialChecker/RamDrive.Diagnostics.DifferentialChecker.csproj" />
+    <Project Path="src/RamDrive.Diagnostics.DifferentialChecker.Generator/RamDrive.Diagnostics.DifferentialChecker.Generator.csproj" />
+    <Project Path="src/RamDrive.Cli.Diag/RamDrive.Cli.Diag.csproj" />
   </Folder>
   <Folder Name="/tests/">
     <Project Path="tests/RamDrive.Core.Tests/RamDrive.Core.Tests.csproj" />
