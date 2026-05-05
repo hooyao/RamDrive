@@ -26,6 +26,30 @@
 
 EXTENDS Naturals, Sequences, FiniteSets, TLC
 
+(***************************************************************************)
+(* SCOPE / LIMITATIONS — read this before treating a passing run as proof. *)
+(*                                                                          *)
+(* This spec is a deliberate simplification:                                *)
+(*                                                                          *)
+(*   - Each callback explicitly chooses between "publish ActualFileSize"   *)
+(*     (correct) and "publish 0" (buggy). The fixed-code config             *)
+(*     (BuggyCallbacks={}) cannot violate the invariant by construction:    *)
+(*     correctness is encoded as an axiom of the model, not derived. So a   *)
+(*     pass on the fixed config is NOT a proof that the real C# code is     *)
+(*     correct.                                                             *)
+(*                                                                          *)
+(*   - The Bug3Repro config (BuggyCallbacks={"FlushFileBuffers"})           *)
+(*     deterministically reproduces the bug pattern in 4 steps and is the   *)
+(*     real contribution of the model: it documents the failure mode, gives *)
+(*     a minimal counterexample, and fails fast if anyone widens            *)
+(*     BuggyCallbacks to model future regressions.                          *)
+(*                                                                          *)
+(* If you want the spec to actually verify the implementation, you would    *)
+(* need to model the C# code's per-callback "read node and produce          *)
+(* FileInfo" step at finer granularity, then prove that no such step can   *)
+(* publish a FileSize that disagrees with the most recent SetFileSize.      *)
+(***************************************************************************)
+
 CONSTANTS
     Files,            \* set of file IDs, e.g. {"f1", "f2"}
     MaxFileSize,      \* upper bound on logical size, e.g. 4

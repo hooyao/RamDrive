@@ -580,8 +580,7 @@ public sealed unsafe class WinFspRamAdapter : IFileSystem
         {
             var (host, filter, action, path, logger) = state;
             int status = host.Notify(filter, action, path);
-            if (FsTracer.Enabled)
-                FsTracer.Trace("Notify", path, $"filter=0x{filter:X} action={action} status=0x{status:X8}");
+            FsTracer.Trace("Notify", path, $"filter=0x{filter:X} action={action} status=0x{status:X8}");
             if (status < 0 && logger.IsEnabled(LogLevel.Trace))
                 logger.LogTrace("FspFileSystemNotify({Path}, filter=0x{Filter:X}, action={Action}) returned 0x{Status:X8}",
                     path, filter, action, status);

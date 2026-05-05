@@ -414,7 +414,6 @@ public sealed class DifferentialAdapter : IFileSystem
         pair.RamCtx = info.Context;
         // Skip ref call (would corrupt the kernel buffer). Status-only comparison
         // would require a separate native buffer for ref; deferred.
-        SwapTo(info, pair.RefCtx);
         info.Context = pair;
         bytesTransferred = bA;
         return sa;

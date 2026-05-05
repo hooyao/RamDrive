@@ -16,10 +16,13 @@
     <PackageReference Include="coverlet.collector" />
     <PackageReference Include="Microsoft.Extensions.Configuration.Json" />
     <PackageReference Include="Microsoft.Extensions.Configuration.Binder" />
+    <PackageReference Include="WinFsp.Native" />
   </ItemGroup>
 
   <ItemGroup>
     <ProjectReference Include="..\..\src\RamDrive.Core\RamDrive.Core.csproj" />
+    <ProjectReference Include="..\..\src\RamDrive.Diagnostics.MemfsReference\RamDrive.Diagnostics.MemfsReference.csproj" />
+    <ProjectReference Include="..\..\src\RamDrive.Diagnostics.DifferentialChecker\RamDrive.Diagnostics.DifferentialChecker.csproj" />
   </ItemGroup>
 
 </Project>
