@@ -71,15 +71,7 @@ public class LevelDbReproTests(RamDriveFixture fx, ITestOutputHelper output) : I
 
     public void Dispose()
     {
-        RamDriveFixture.SetTraceFilter(null);
         try { Directory.Delete(_dir, true); } catch { }
-    }
-
-    private void DumpTrace()
-    {
-        output.WriteLine("=== TraceLog ===");
-        lock (RamDriveFixture.TraceLog)
-            foreach (var line in RamDriveFixture.TraceLog) output.WriteLine(line);
     }
 
     /// <summary>
@@ -97,7 +89,6 @@ public class LevelDbReproTests(RamDriveFixture fx, ITestOutputHelper output) : I
         string tmp = Path.Combine(_dir, "dbtmp");
         string cur = Path.Combine(_dir, "CURRENT");
 
-        RamDriveFixture.SetTraceFilter("ldb_");
 
         // Phase 1: write dbtmp via Win32 cached I/O (default — no FILE_FLAG_WRITE_THROUGH/NO_BUFFERING)
         nint h = LevelDbWin32.CreateFile(tmp,
@@ -135,7 +126,6 @@ public class LevelDbReproTests(RamDriveFixture fx, ITestOutputHelper output) : I
         }
         catch
         {
-            DumpTrace();
             throw;
         }
     }
@@ -151,7 +141,6 @@ public class LevelDbReproTests(RamDriveFixture fx, ITestOutputHelper output) : I
         string tmp = Path.Combine(_dir, "dbtmp");
         string cur = Path.Combine(_dir, "CURRENT");
 
-        RamDriveFixture.SetTraceFilter("ldb_");
 
         nint h = LevelDbWin32.CreateFile(tmp,
             LevelDbWin32.GENERIC_WRITE | (1u << 16) /* DELETE */, LevelDbWin32.FILE_SHARE_READ | LevelDbWin32.FILE_SHARE_WRITE | LevelDbWin32.FILE_SHARE_DELETE,
@@ -200,7 +189,6 @@ public class LevelDbReproTests(RamDriveFixture fx, ITestOutputHelper output) : I
         }
         catch
         {
-            DumpTrace();
             throw;
         }
     }
@@ -221,7 +209,6 @@ public class LevelDbReproTests(RamDriveFixture fx, ITestOutputHelper output) : I
         string curUpperCase = Path.Combine(_dir, "CURRENT");
         string curLowerCase = Path.Combine(_dir, "current"); // read with completely different case
 
-        RamDriveFixture.SetTraceFilter("ldb_");
 
         nint h = LevelDbWin32.CreateFile(tmpMixedCase,
             LevelDbWin32.GENERIC_WRITE, LevelDbWin32.FILE_SHARE_READ,
@@ -254,7 +241,6 @@ public class LevelDbReproTests(RamDriveFixture fx, ITestOutputHelper output) : I
         }
         catch
         {
-            DumpTrace();
             throw;
         }
     }
@@ -289,7 +275,10 @@ public class LevelDbDefaultTimeoutTests : IDisposable
             new Microsoft.Extensions.Options.OptionsWrapper<RamDriveOptions>(options),
             Microsoft.Extensions.Logging.Abstractions.NullLogger<RamDriveCore.Memory.PagePool>.Instance);
         _fs = new RamDriveCore.FileSystem.RamFileSystem(_pool);
-        _host = new FileSystemHost(new TestAdapter(_fs, options))
+        _host = new FileSystemHost(new RamDriveCore.FileSystem.WinFspRamAdapter(
+            _fs,
+            new Microsoft.Extensions.Options.OptionsWrapper<RamDriveOptions>(options),
+            Microsoft.Extensions.Logging.Abstractions.NullLogger<RamDriveCore.FileSystem.WinFspRamAdapter>.Instance))
         {
             Prefix = $@"\winfsp-tests\itest-default-{Environment.ProcessId}",
         };

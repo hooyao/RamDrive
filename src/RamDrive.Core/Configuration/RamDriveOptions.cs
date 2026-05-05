@@ -19,20 +19,37 @@ public sealed class RamDriveOptions
     /// <summary>
     /// Lifetime of the WinFsp kernel <c>FileInfo</c> cache, in milliseconds. Default 1000.
     ///
-    /// <para>The adapter sends <c>FspFileSystemNotify</c> calls after every path-mutating
-    /// operation (rename, delete, overwrite, create, set-size, set-attrs) so the cache is
-    /// invalidated explicitly. This timeout is defence in depth for any path that escapes
-    /// the notification matrix.</para>
+    /// <para>Cache coherence relies on every IFileSystem callback returning the correct
+    /// post-operation <c>FspFileInfo</c> in its response (the kernel updates Cc with that
+    /// FileInfo). <see cref="EnableNotifications"/> can be turned on for defence in depth
+    /// during debugging — the production default is off because correct callback responses
+    /// are sufficient.</para>
     ///
     /// <para>Special values:
     /// <list type="bullet">
     /// <item><c>0</c> — cache disabled (same effect as <see cref="EnableKernelCache"/>=false).</item>
     /// <item><c>uint.MaxValue</c> (4294967295) — cache effectively permanent. Correctness
-    /// depends entirely on the notification matrix; the integration test fixture pins this
-    /// value to catch regressions.</item>
+    /// depends entirely on every callback returning a correct FileInfo; the integration
+    /// test fixture pins this value to catch regressions.</item>
     /// </list></para>
     /// </summary>
     public uint FileInfoTimeoutMs { get; set; } = 1000;
+
+    /// <summary>
+    /// Send <c>FspFileSystemNotify</c> after every path-mutating callback (Create, Write,
+    /// SetFileSize, SetFileAttributes, Rename, Delete) to proactively invalidate the WinFsp
+    /// kernel <c>FileInfo</c> cache.
+    ///
+    /// <para>Default <c>false</c>. Cache coherence in normal operation is maintained by
+    /// every IFileSystem callback returning the correct post-operation FileInfo in its
+    /// <c>FsResult</c>; the kernel updates Cc directly from that. Notifications are
+    /// redundant in that case and add a small kernel-IOCTL overhead per mutation.</para>
+    ///
+    /// <para>Set to <c>true</c> when debugging suspected cache-coherence regressions —
+    /// notifications act as a belt-and-braces invalidation in case some callback
+    /// accidentally returns a stale or empty FileInfo.</para>
+    /// </summary>
+    public bool EnableNotifications { get; set; }
 
     /// <summary>
     /// Tree of directories to create at the root of the RAM disk after mounting.

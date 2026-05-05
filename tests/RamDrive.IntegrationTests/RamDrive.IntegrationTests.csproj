@@ -18,6 +18,8 @@
 
     <ItemGroup>
         <ProjectReference Include="..\..\src\RamDrive.Core\RamDrive.Core.csproj"/>
+        <ProjectReference Include="..\..\src\RamDrive.Diagnostics.MemfsReference\RamDrive.Diagnostics.MemfsReference.csproj"/>
+        <ProjectReference Include="..\..\src\RamDrive.Diagnostics.DifferentialChecker\RamDrive.Diagnostics.DifferentialChecker.csproj"/>
     </ItemGroup>
 
 </Project>
