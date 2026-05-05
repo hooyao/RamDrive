@@ -201,8 +201,6 @@ end;
 function NextButtonClick(CurPageID: Integer): Boolean;
 var
   CapVal: Integer;
-  TargetLetter: Char;
-  TempPath: string;
 begin
   Result := True;
   if CurPageID = ConfigPage.ID then
@@ -220,31 +218,6 @@ begin
     if CapVal < 16 then
     begin
       MsgBox('Capacity must be at least 16 MB.', mbError, MB_OK);
-      Result := False;
-      Exit;
-    end;
-
-    // Refuse to install if the installer's temp directory ({tmp}) is on the
-    // same drive the user just chose for the RAM disk. Installing would stop
-    // the existing RamDrive service to swap binaries; that unmounts the drive
-    // and erases {tmp} mid-install, leaving the system in a broken state
-    // (service stopped, new exe not in place, installer crashed).
-    TargetLetter := UpCase(DriveCombo.Text[1]);
-    TempPath := ExpandConstant('{tmp}');
-    if (Length(TempPath) >= 2) and (UpCase(TempPath[1]) = TargetLetter) and (TempPath[2] = ':') then
-    begin
-      MsgBox(
-        'The installer''s temporary directory is on drive ' + TargetLetter + ':' + #13#10 +
-        '(' + TempPath + ')' + #13#10 + #13#10 +
-        'This is the same drive you selected for the RAM disk. The installer ' +
-        'must stop the existing RamDrive service to swap binaries; doing so ' +
-        'unmounts ' + TargetLetter + ': and would delete the installer''s own ' +
-        'working files mid-install.' + #13#10 + #13#10 +
-        'Re-run the installer from a command prompt with /T= pointing at a ' +
-        'directory NOT on the RAM disk, e.g.:' + #13#10 + #13#10 +
-        '    ' + ExpandConstant('{srcexe}') + ' /T=C:\Windows\Temp' + #13#10 + #13#10 +
-        '(or any directory on a different physical drive).',
-        mbError, MB_OK);
       Result := False;
       Exit;
     end;
@@ -428,8 +401,68 @@ end;
 function InitializeSetup: Boolean;
 var
   Choice: Integer;
+  TempPath: string;
+  NewTempDir: string;
+  ResultCode: Integer;
 begin
   Result := True;
+
+  // Heads-up before we touch anything: if the user's TEMP is on a RAM disk
+  // (their own existing one, or any other WinFsp mount), the installer will
+  // self-destruct when sc.exe stop unmounts the drive. We can't reliably
+  // detect "is this drive a RAM disk" from inside Inno Setup, so we ask the
+  // user — and if they want to relocate, we re-launch with TEMP overridden.
+  TempPath := ExpandConstant('{tmp}');
+  Choice := TaskDialogMsgBox(
+    'TEMP folder check',
+    'If your TEMP folder is on a RAM disk, this installer will fail mid-install. ' +
+    'Stopping the existing RamDrive service to swap binaries unmounts the RAM ' +
+    'disk — which deletes the installer''s own working files (in TEMP), leaving ' +
+    'the system in a broken state (service stopped, new binaries not in place).' + #13#10 + #13#10 +
+    'Current TEMP location:' + #13#10 +
+    '    ' + TempPath,
+    mbError,
+    MB_YESNOCANCEL, ['Continue installation' + #13#10 + 'TEMP is NOT on a RAM disk — safe to proceed.',
+     'Pick a different TEMP folder...' + #13#10 + 'Browse to a folder on a non-RAM-disk drive; the installer will re-launch with TEMP set there.',
+     'Cancel' + #13#10 + 'Exit the installer.'],
+    0);
+
+  if Choice = IDYES then
+  begin
+    // Continue as-is.
+  end
+  else if Choice = IDNO then
+  begin
+    // Browse for a new TEMP folder.
+    NewTempDir := ExpandConstant('{sd}\Windows\Temp');
+    if not BrowseForFolder('Choose a TEMP folder NOT on a RAM disk:', NewTempDir, True) then
+    begin
+      Result := False;
+      Exit;
+    end;
+    if not DirExists(NewTempDir) then
+    begin
+      MsgBox('Folder does not exist: ' + NewTempDir, mbError, MB_OK);
+      Result := False;
+      Exit;
+    end;
+    // Re-launch ourselves with TEMP/TMP overridden via cmd.exe so the
+    // child process inherits the new environment. We use cmd /c to set
+    // env vars then start the installer detached, and exit ourselves so
+    // {tmp} (already created on the RAM disk) gets cleaned up cleanly.
+    Exec(
+      ExpandConstant('{cmd}'),
+      '/c set "TEMP=' + NewTempDir + '" && set "TMP=' + NewTempDir + '" && start "" "' + ExpandConstant('{srcexe}') + '"',
+      '', SW_HIDE, ewNoWait, ResultCode);
+    Result := False;
+    Exit;
+  end
+  else
+  begin
+    // IDCANCEL or any other return — abort.
+    Result := False;
+    Exit;
+  end;
 
   if IsRamDriveRunning then
   begin
