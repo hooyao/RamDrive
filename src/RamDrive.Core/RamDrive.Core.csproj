@@ -7,6 +7,13 @@
         <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
     </PropertyGroup>
 
+    <!-- TRACE_FS: enable FsTracer.Trace() call sites in WinFspRamAdapter for diagnostic builds.
+         Conditional attribute is evaluated at the CALLER's compile time — must be defined where
+         the call sites live (this project), not just in RamDrive.Cli.Diag. -->
+    <PropertyGroup Condition="'$(Configuration)' == 'Debug'">
+        <DefineConstants>$(DefineConstants);TRACE_FS</DefineConstants>
+    </PropertyGroup>
+
     <ItemGroup>
         <InternalsVisibleTo Include="RamDrive.Core.Tests"/>
     </ItemGroup>
