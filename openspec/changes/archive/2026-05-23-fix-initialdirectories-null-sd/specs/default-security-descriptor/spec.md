@@ -1,9 +1,5 @@
-# default-security-descriptor
+## MODIFIED Requirements
 
-## Purpose
-
-Owns the volume root's default security descriptor and the rule that newly-created files and directories must inherit access from the root such that the creating principal can subsequently open them. Concretely: the root SDDL must carry `OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE` (`OICI`) flags on every ACE, otherwise WinFsp's kernel-side `FspCreateSecurityDescriptor` produces children with empty DACLs ("deny everyone") and reopen returns `ACCESS_DENIED`.
-## Requirements
 ### Requirement: Volume root security descriptor SHALL grant inheritable access
 
 The constant security descriptor applied to the volume root in `WinFspRamAdapter.Init` MUST be a SDDL string in which every ACE in the DACL carries both `OBJECT_INHERIT_ACE` (`OI`) and `CONTAINER_INHERIT_ACE` (`CI`) flags. WinFsp's kernel `FspCreateSecurityDescriptor` walks the parent DACL when computing the SD for a newly-created child and copies only ACEs whose flags say "inherit". With both flags present, the parent's `(A;OICI;FA;;;<sid>)` ACE produces a child ACE granting the same access (`FA` = `FILE_ALL_ACCESS`, including `DELETE`, `READ_CONTROL`, `SYNCHRONIZE`) to that SID on every newly-created file and directory.
@@ -89,4 +85,3 @@ The same SDDL constant MUST be used by the integration test fixture's `TestAdapt
 - **AND** the `Microsoft-Windows-AppModel-Runtime/Admin` log does NOT show repeated `201`/`217` create/destroy pairs at sub-minute intervals for that package
 
   *Note: this scenario captures end-user-observable behaviour for the bug that motivated this change. It is environment-sensitive (requires the MSIX package installed) and serves as the manual acceptance check; the scenarios above are automatable and together imply this outcome.*
-

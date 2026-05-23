@@ -57,7 +57,10 @@ public sealed class RamFileSystem : IDisposable
             if (parent.Children!.ContainsKey(name)) return null;
 
             var node = FileNode.CreateFile(name, _pool);
-            node.SecurityDescriptor = securityDescriptor;
+            // When the caller does not supply an SD, inherit the parent's by reference.
+            // Copy-on-write contract: SetFileSecurity allocates a fresh byte[] before
+            // assigning, so this share is broken on the first explicit ACL change.
+            node.SecurityDescriptor = securityDescriptor ?? parent.SecurityDescriptor;
             node.Parent = parent;
             parent.Children[name] = node;
             parent.LastWriteTime = DateTime.UtcNow;
@@ -78,7 +81,8 @@ public sealed class RamFileSystem : IDisposable
             if (parent.Children!.ContainsKey(name)) return null;
 
             var node = FileNode.CreateDirectory(name);
-            node.SecurityDescriptor = securityDescriptor;
+            // See CreateFile for the inherit-by-reference / copy-on-write contract.
+            node.SecurityDescriptor = securityDescriptor ?? parent.SecurityDescriptor;
             node.Parent = parent;
             parent.Children[name] = node;
             parent.LastWriteTime = DateTime.UtcNow;
