@@ -114,7 +114,7 @@ jobs:
         shell: pwsh
         run: |
           $version = "${{ steps.version.outputs.VERSION }}"
-          Compress-Archive -Path publish-aot/RamDrive.exe, publish-aot/appsettings.jsonc -DestinationPath "RamDrive-$version.zip"
+          Compress-Archive -Path publish-aot/RamDrive.exe, publish-aot/appsettings.jsonc -DestinationPath "RamDrive-$version-x64.zip"
           Compress-Archive -Path publish-aot-arm64/RamDrive.exe, publish-aot-arm64/appsettings.jsonc -DestinationPath "RamDrive-$version-arm64.zip"
 
       - name: Create GitHub Release
@@ -124,13 +124,13 @@ jobs:
         run: |
           $version = "${{ steps.version.outputs.VERSION }}"
           $prerelease = "${{ steps.version.outputs.PRERELEASE }}"
-          $installerX64   = Get-ChildItem "installer-output/RamDrive-$version-setup.exe"       | Select-Object -First 1
+          $installerX64   = Get-ChildItem "installer-output/RamDrive-$version-x64-setup.exe"   | Select-Object -First 1
           $installerArm64 = Get-ChildItem "installer-output/RamDrive-$version-arm64-setup.exe" | Select-Object -First 1
           $ghArgs = @(
             "release", "create", "v$version",
             "--title", "RamDrive $version",
             "--generate-notes",
-            "RamDrive-$version.zip",
+            "RamDrive-$version-x64.zip",
             "RamDrive-$version-arm64.zip",
             $installerX64.FullName,
             $installerArm64.FullName

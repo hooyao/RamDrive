@@ -5,10 +5,12 @@
 ; Architecture switching:
 ;   Default build is x64. Compile with:
 ;     ISCC.exe setup\RamDrive.iss                       ; x64 installer
+;                                                       ; → RamDrive-X.Y.Z-x64-setup.exe
 ;     ISCC.exe /DMyAppArch=arm64 setup\RamDrive.iss     ; ARM64 installer
+;                                                       ; → RamDrive-X.Y.Z-arm64-setup.exe
 ;   The ARM64 leg expects publish output in ..\publish-aot-arm64; the x64 leg
-;   uses ..\publish-aot (unchanged). WinFsp's MSI is architecture-universal —
-;   the same .msi is bundled regardless of MyAppArch.
+;   uses ..\publish-aot. WinFsp's MSI is architecture-universal — the same
+;   .msi is bundled regardless of MyAppArch.
 
 #define MyAppName      "RamDrive"
 #define MyAppVersion   "0.0.0-dev"
@@ -27,7 +29,7 @@
   #define ArchInstall64    "arm64"
 #elif MyAppArch == "x64"
   #define PublishDir       "..\publish-aot"
-  #define ArchSuffix       ""
+  #define ArchSuffix       "-x64"
   #define ArchAllowed      "x64compatible"
   #define ArchInstall64    "x64compatible"
 #else
