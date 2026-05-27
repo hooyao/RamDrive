@@ -1,6 +1,14 @@
 ; RamDrive Inno Setup Script
 ; Bundles RamDrive AOT exe + WinFsp installer
 ; Supports both portable (green) and Windows Service modes
+;
+; Architecture switching:
+;   Default build is x64. Compile with:
+;     ISCC.exe setup\RamDrive.iss                       ; x64 installer
+;     ISCC.exe /DMyAppArch=arm64 setup\RamDrive.iss     ; ARM64 installer
+;   The ARM64 leg expects publish output in ..\publish-aot-arm64; the x64 leg
+;   uses ..\publish-aot (unchanged). WinFsp's MSI is architecture-universal —
+;   the same .msi is bundled regardless of MyAppArch.
 
 #define MyAppName      "RamDrive"
 #define MyAppVersion   "0.0.0-dev"
@@ -8,11 +16,27 @@
 #define MyAppExeName   "RamDrive.exe"
 #define MyAppURL       "https://github.com/hooyao/RamDrive"
 
-; Path to AOT publish output (relative to this .iss file)
-#define PublishDir     "..\publish-aot"
+#ifndef MyAppArch
+  #define MyAppArch    "x64"
+#endif
+
+#if MyAppArch == "arm64"
+  #define PublishDir       "..\publish-aot-arm64"
+  #define ArchSuffix       "-arm64"
+  #define ArchAllowed      "arm64"
+  #define ArchInstall64    "arm64"
+#elif MyAppArch == "x64"
+  #define PublishDir       "..\publish-aot"
+  #define ArchSuffix       ""
+  #define ArchAllowed      "x64compatible"
+  #define ArchInstall64    "x64compatible"
+#else
+  #error Unsupported MyAppArch. Use "x64" or "arm64".
+#endif
 
 ; WinFsp MSI filename - place the .msi in the setup\ folder before compiling
-; Download from https://winfsp.dev/rel/
+; Download from https://winfsp.dev/rel/ — the MSI is arch-universal and
+; installs winfsp-x64.dll, winfsp-a64.dll, and winfsp-x86.dll regardless of OS.
 #define WinFspMsi      "winfsp-2.1.25156.msi"
 
 [Setup]
@@ -25,11 +49,12 @@ DefaultDirName={autopf}\{#MyAppName}
 DefaultGroupName={#MyAppName}
 DisableProgramGroupPage=yes
 OutputDir=..\installer-output
-OutputBaseFilename=RamDrive-{#MyAppVersion}-setup
+OutputBaseFilename=RamDrive-{#MyAppVersion}{#ArchSuffix}-setup
 Compression=lzma2/ultra64
 SolidCompression=yes
 PrivilegesRequired=admin
-ArchitecturesAllowed=x64compatible
+ArchitecturesAllowed={#ArchAllowed}
+ArchitecturesInstallIn64BitMode={#ArchInstall64}
 MinVersion=10.0
 SetupIconFile=compiler:SetupClassicIcon.ico
 UninstallDisplayIcon={app}\{#MyAppExeName}
