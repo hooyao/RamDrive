@@ -142,10 +142,25 @@ public class ChaosTests(RamDriveFixture fx)
                     // merely mis-attributed which write won => TEST false positive), or does the disk
                     // hold content that was never written to it (=> REAL filesystem bug)?
                     bool legit = fi.DiskMatchesAKnownWrite(data);
+                    string forensic = "";
+                    if (!legit)
+                    {
+                        // Forensics to localise the corruption:
+                        //   prefixMatchesExpected=true + tailAllZero=true  => file was extended after the
+                        //       overwrite (logical size grew, tail zero-filled) — a SetLength/size race.
+                        //   prefixMatchesExpected=true + tailAllZero=false => overwrite content is intact but
+                        //       the file was NOT shrunk — stale tail from the previous (larger) content.
+                        //   prefixMatchesExpected=false                    => even the leading bytes are wrong
+                        //       — content corruption / cross-file page aliasing.
+                        var exp = fi.LastKnownData;
+                        bool prefixOk = exp != null && data.Length >= exp.Length && data.AsSpan(0, exp.Length).SequenceEqual(exp);
+                        bool tailZero = exp != null && data.Length > exp.Length && data.AsSpan(exp.Length).IndexOfAnyExcept((byte)0) < 0;
+                        forensic = $" knownSizes=[{fi.KnownSizes}] prefixMatchesExpected={prefixOk} tailAllZero={tailZero}";
+                    }
                     Console.Error.WriteLine(
                         $"[INTEGRITY-{(legit ? "TESTRACE" : "REALBUG")}] {fi.Path} " +
                         $"expSize={snap.ExpSize} gotLen={data.Length} sizeMatch={data.Length == snap.ExpSize} " +
-                        $"diskMatchesAKnownWrite={legit} knownWrites={fi.KnownWriteCount}");
+                        $"diskMatchesAKnownWrite={legit} knownWrites={fi.KnownWriteCount}{forensic}");
                 }
                 break;
             }
@@ -255,12 +270,15 @@ public class ChaosTests(RamDriveFixture fx)
         // attributed the wrong one (TEST false positive); if not, the disk holds content that was
         // never written to this file (REAL filesystem bug — e.g. page aliasing / lost write).
         private readonly System.Collections.Concurrent.ConcurrentDictionary<string, byte> _writeHashes = new();
-        public void RecordWrite(byte[] data) => _writeHashes[Convert.ToHexString(SHA256.HashData(data))] = 0;
+        private readonly System.Collections.Concurrent.ConcurrentQueue<long> _writeSizes = new();
+        public byte[]? LastKnownData;   // gen-winner's content, for prefix/tail forensics
+        public void RecordWrite(byte[] data) { _writeHashes[Convert.ToHexString(SHA256.HashData(data))] = 0; _writeSizes.Enqueue(data.Length); }
         public bool DiskMatchesAKnownWrite(byte[] disk) => _writeHashes.ContainsKey(Convert.ToHexString(SHA256.HashData(disk)));
         public int KnownWriteCount => _writeHashes.Count;
+        public string KnownSizes => string.Join(",", _writeSizes);
 
         public TrackedFile(string path, byte[] data)
-        { Path = path; Size = data.Length; Hash = SHA256.HashData(data); Generation = 0; RecordWrite(data); }
+        { Path = path; Size = data.Length; Hash = SHA256.HashData(data); Generation = 0; RecordWrite(data); LastKnownData = data; }
 
         public long Mutated(long newSize) { lock (_lk) { Size = newSize; Hash = null; return ++Generation; } }
         public void SetKnown(byte[] data, long expectedGen)
@@ -269,7 +287,7 @@ public class ChaosTests(RamDriveFixture fx)
             {
                 // Only update hash if no concurrent mutation happened since our Mutated() call
                 if (Generation != expectedGen) return;
-                Size = data.Length; Hash = SHA256.HashData(data);
+                Size = data.Length; Hash = SHA256.HashData(data); LastKnownData = data;
             }
         }
 
