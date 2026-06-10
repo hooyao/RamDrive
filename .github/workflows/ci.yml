@@ -65,6 +65,8 @@ jobs:
 
       - name: Test
         shell: pwsh
+        env:
+          CHAOS_DURATION_SEC: "90"   # TEMP diagnostic: longer fuzz to surface the rare integrity race
         run: |
           $projects = @(
             "tests/RamDrive.Core.Tests/RamDrive.Core.Tests.csproj",

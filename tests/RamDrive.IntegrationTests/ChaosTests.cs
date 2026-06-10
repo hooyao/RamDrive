@@ -138,7 +138,14 @@ public class ChaosTests(RamDriveFixture fx)
                 if (!fi.VerifySnapshot(snap, data))
                 {
                     Interlocked.Increment(ref integrityFails);
-                    Console.Error.WriteLine($"[INTEGRITY] {fi.Path} expSize={snap.ExpSize} gotLen={data.Length} sizeMatch={data.Length == snap.ExpSize} gen={snap.Gen}");
+                    // Classify: did the filesystem preserve a REAL write to this file (so the test
+                    // merely mis-attributed which write won => TEST false positive), or does the disk
+                    // hold content that was never written to it (=> REAL filesystem bug)?
+                    bool legit = fi.DiskMatchesAKnownWrite(data);
+                    Console.Error.WriteLine(
+                        $"[INTEGRITY-{(legit ? "TESTRACE" : "REALBUG")}] {fi.Path} " +
+                        $"expSize={snap.ExpSize} gotLen={data.Length} sizeMatch={data.Length == snap.ExpSize} " +
+                        $"diskMatchesAKnownWrite={legit} knownWrites={fi.KnownWriteCount}");
                 }
                 break;
             }
@@ -170,6 +177,7 @@ public class ChaosTests(RamDriveFixture fx)
             {
                 var fi = w.PickFile(rng); if (fi == null) goto case Op.CreateFile;
                 int sz = rng.Next(0, 256 * 1024); var data = new byte[sz]; rng.NextBytes(data);
+                fi.RecordWrite(data); // diagnostic: remember this write even if it loses the gen race
                 long gen = fi.Mutated(0); // invalidate before write — ReadVerify will see generation change
                 File.WriteAllBytes(fi.Path, data);
                 fi.SetKnown(data, gen); // only set hash if no concurrent mutation
@@ -240,8 +248,19 @@ public class ChaosTests(RamDriveFixture fx)
         public byte[]? Hash; // null = dirty (partial writes invalidated ground truth)
         public long Generation; // incremented on every mutation
 
+        // --- diagnostic: classify integrity failures as test-race vs real filesystem bug ---
+        // Every full-content write (CreateFile / Overwrite) records its content hash. On an
+        // integrity failure we check whether the bytes actually on disk match ANY genuine write:
+        // if so, the filesystem preserved a real write and the test's generation-tracking merely
+        // attributed the wrong one (TEST false positive); if not, the disk holds content that was
+        // never written to this file (REAL filesystem bug — e.g. page aliasing / lost write).
+        private readonly System.Collections.Concurrent.ConcurrentDictionary<string, byte> _writeHashes = new();
+        public void RecordWrite(byte[] data) => _writeHashes[Convert.ToHexString(SHA256.HashData(data))] = 0;
+        public bool DiskMatchesAKnownWrite(byte[] disk) => _writeHashes.ContainsKey(Convert.ToHexString(SHA256.HashData(disk)));
+        public int KnownWriteCount => _writeHashes.Count;
+
         public TrackedFile(string path, byte[] data)
-        { Path = path; Size = data.Length; Hash = SHA256.HashData(data); Generation = 0; }
+        { Path = path; Size = data.Length; Hash = SHA256.HashData(data); Generation = 0; RecordWrite(data); }
 
         public long Mutated(long newSize) { lock (_lk) { Size = newSize; Hash = null; return ++Generation; } }
         public void SetKnown(byte[] data, long expectedGen)
