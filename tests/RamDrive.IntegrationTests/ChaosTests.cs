@@ -136,7 +136,10 @@ public class ChaosTests(RamDriveFixture fx)
                 byte[] data;
                 try { data = File.ReadAllBytes(fi.Path); } catch (FileNotFoundException) { break; }
                 if (!fi.VerifySnapshot(snap, data))
+                {
                     Interlocked.Increment(ref integrityFails);
+                    Console.Error.WriteLine($"[INTEGRITY] {fi.Path} expSize={snap.ExpSize} gotLen={data.Length} sizeMatch={data.Length == snap.ExpSize} gen={snap.Gen}");
+                }
                 break;
             }
             case Op.Truncate:
