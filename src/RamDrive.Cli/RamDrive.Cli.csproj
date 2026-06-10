@@ -16,10 +16,15 @@
         <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
     </PropertyGroup>
 
-    <!-- Release-only AOT flags: wide SIMD + smaller binary -->
+    <!-- Release-only AOT flags: smaller binary across arches -->
     <PropertyGroup Condition="'$(Configuration)' == 'Release'">
-        <IlcInstructionSet>x86-64-v3,aes</IlcInstructionSet>
         <StackTraceSupport>false</StackTraceSupport>
+    </PropertyGroup>
+
+    <!-- x64-only: widen SIMD baseline to x86-64-v3 (avx2+bmi1+bmi2+fma+lzcnt+movbe) plus AES-NI.
+         ARM64 takes the AOT default (baseline ARMv8), which is fine for compatibility. -->
+    <PropertyGroup Condition="'$(Configuration)' == 'Release' AND '$(RuntimeIdentifier)' == 'win-x64'">
+        <IlcInstructionSet>x86-64-v3,aes</IlcInstructionSet>
     </PropertyGroup>
 
     <ItemGroup>

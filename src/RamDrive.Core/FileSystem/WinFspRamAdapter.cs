@@ -58,6 +58,17 @@ public sealed unsafe class WinFspRamAdapter : IFileSystem
     private readonly ILogger<WinFspRamAdapter> _logger;
     private FileSystemHost? _host;
 
+    // Cached canonical root SD bytes, computed once at construction. Used as a defensive
+    // fallback in GetFileSecurityByName / GetFileSecurity if a FileNode is ever encountered
+    // with a null SecurityDescriptor (regression of the "no null SD nodes" invariant
+    // enforced by RamFileSystem.CreateFile/CreateDirectory).
+    private readonly byte[] _rootSecurityDescriptorBytes;
+
+    // One-shot warning suppression for the defensive fallback above. Bounded growth: only
+    // ever populated when the structural invariant breaks, which is a bug we want to know
+    // about — duplicates per-path are noise, but the first hit per path is signal.
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<string, byte> _nullSdWarnedPaths = new(StringComparer.OrdinalIgnoreCase);
+
     public WinFspRamAdapter(RamFileSystem fs, IOptions<RamDriveOptions> options, ILogger<WinFspRamAdapter> logger)
     {
         _fs = fs;
@@ -69,6 +80,7 @@ public sealed unsafe class WinFspRamAdapter : IFileSystem
         var bytes = new byte[sd.BinaryLength];
         sd.GetBinaryForm(bytes, 0);
         _fs.SetRootSecurityDescriptor(bytes);
+        _rootSecurityDescriptorBytes = bytes;
     }
 
     // ═══════════════════════════════════════════
@@ -136,9 +148,26 @@ public sealed unsafe class WinFspRamAdapter : IFileSystem
         }
 
         fileAttributes = (uint)node.Attributes;
-        securityDescriptor = node.SecurityDescriptor;
+        securityDescriptor = node.SecurityDescriptor ?? FallbackSdFor(fileName);
         FsTracer.Trace("GetFileSecurityByName", fileName, $"attr=0x{fileAttributes:X}");
         return NtStatus.Success;
+    }
+
+    // Defensive fallback for GetFileSecurityByName / GetFileSecurity. Should be unreachable
+    // post-fix: RamFileSystem.CreateFile/CreateDirectory always assigns a non-null SD by
+    // inheriting from parent. If we get here, something bypassed those code paths and the
+    // tree's structural invariant is broken — warn once per path so the regression is loud.
+    private byte[] FallbackSdFor(string path)
+    {
+        if (_nullSdWarnedPaths.TryAdd(path, 0))
+        {
+            _logger.LogWarning(
+                "Node at {Path} has null SecurityDescriptor — falling back to root SD. " +
+                "This indicates a bypass of RamFileSystem.CreateFile/CreateDirectory's " +
+                "SD-inheritance contract; treat as a bug to investigate.",
+                path);
+        }
+        return _rootSecurityDescriptorBytes;
     }
 
     // ═══════════════════════════════════════════
@@ -404,7 +433,7 @@ public sealed unsafe class WinFspRamAdapter : IFileSystem
         if (node == null)
             return NtStatus.ObjectNameNotFound;
 
-        securityDescriptor = node.SecurityDescriptor;
+        securityDescriptor = node.SecurityDescriptor ?? FallbackSdFor(fileName);
         return NtStatus.Success;
     }
 

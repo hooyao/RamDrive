@@ -109,3 +109,23 @@ jobs:
           only-summary: 'false'
           list-suites: all
           list-tests: failed
+
+      - name: Cross-compile AOT for win-arm64
+        shell: pwsh
+        run: |
+          # Catch ARM64-only AOT compile failures (e.g. a new package without
+          # win-arm64 support, IlcInstructionSet leakage) early. We cross-publish
+          # from the x64 host; runtime behaviour on ARM64 is exercised by the
+          # downstream release build + the WinFsp.Native ARM64 CI leg, since
+          # this repo's integration tests need a real WinFsp mount which the
+          # x64 runner can't host for an arm64 binary.
+          dotnet publish src/RamDrive.Cli/RamDrive.Cli.csproj `
+            -c Release -r win-arm64 `
+            -o ./publish-aot-arm64-ci
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          # Sanity: produced exe must exist.
+          if (-not (Test-Path "./publish-aot-arm64-ci/RamDrive.exe")) {
+            Write-Error "ARM64 cross-publish completed but RamDrive.exe is missing"
+            exit 1
+          }
+          Write-Host "ARM64 cross-publish OK: $((Get-Item ./publish-aot-arm64-ci/RamDrive.exe).Length) bytes"
