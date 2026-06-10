@@ -37,7 +37,10 @@ public sealed class RamDriveFixture : IDisposable
         {
             CapacityMb = CapacityMb,
             PageSizeKb = 64,
-            EnableKernelCache = true,
+            // TEMP diagnostic: RAMDRIVE_DISABLE_CACHE=1 turns the kernel cache off to test
+            // whether the chaos integrity corruption requires the cache (=> cache-coherency)
+            // or persists without it (=> user-mode concurrency). Default stays on.
+            EnableKernelCache = Environment.GetEnvironmentVariable("RAMDRIVE_DISABLE_CACHE") != "1",
             // Pin to worst-case (permanent) cache lifetime so missing FspFileSystemNotify
             // calls produce stale-cache test failures in CI rather than only against
             // real Chromium with the production default. See specs/cache-invalidation.
