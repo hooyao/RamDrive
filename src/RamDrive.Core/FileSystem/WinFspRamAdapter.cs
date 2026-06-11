@@ -58,6 +58,19 @@ public sealed unsafe class WinFspRamAdapter : IFileSystem
     private readonly ILogger<WinFspRamAdapter> _logger;
     private FileSystemHost? _host;
 
+    // DIAGNOSTIC (env-gated by RAMDRIVE_OPLOG=1): per-file ring of recent size-changing
+    // callbacks, dumped by ChaosTests on an integrity REALBUG to pin exactly which callback
+    // sequence produced a corrupted (oversized/stale) file. Off (and zero-cost) in production.
+    public static readonly System.Collections.Concurrent.ConcurrentDictionary<string, System.Collections.Concurrent.ConcurrentQueue<string>> DiagOps = new();
+    private static readonly bool _diagOps = Environment.GetEnvironmentVariable("RAMDRIVE_OPLOG") == "1";
+    private static void DiagLog(string? path, string entry)
+    {
+        if (!_diagOps || path is null) return;
+        var q = DiagOps.GetOrAdd(System.IO.Path.GetFileName(path), static _ => new System.Collections.Concurrent.ConcurrentQueue<string>());
+        q.Enqueue($"T{Environment.CurrentManagedThreadId} {entry}");
+        while (q.Count > 48) q.TryDequeue(out _);
+    }
+
     // Cached canonical root SD bytes, computed once at construction. Used as a defensive
     // fallback in GetFileSecurityByName / GetFileSecurity if a FileNode is ever encountered
     // with a null SecurityDescriptor (regression of the "no null SD nodes" invariant
@@ -222,6 +235,7 @@ public sealed unsafe class WinFspRamAdapter : IFileSystem
 
         info.Context = file;
         info.IsDirectory = false;
+        DiagLog(fileName, $"CREATE alloc={allocationSize}");
         FsTracer.Trace("CreateFile", fileName, $"co=0x{createOptions:X} ga=0x{grantedAccess:X} alloc={allocationSize}");
         // Cache invalidation: see comment above for the directory branch.
         Notify(FileNotify.ChangeFileName, FileNotify.ActionAdded, fileName);
@@ -255,6 +269,7 @@ public sealed unsafe class WinFspRamAdapter : IFileSystem
 
         long sizeBefore = node.Content.Length;
         node.Content.SetLength(0);
+        DiagLog(info.FileName, $"OVERWRITE before={sizeBefore} ->0 alloc={allocationSize} after={node.Content.Length}");
 
         // Early capacity check: if the caller hints at the final file size,
         // fail fast before the copy begins rather than mid-write.
@@ -329,12 +344,14 @@ public sealed unsafe class WinFspRamAdapter : IFileSystem
         int written = node.Content.Write(writeOffset, buffer.Span[..writeLength]);
         if (written < 0)
         {
+            DiagLog(fileName, $"WRITE off={writeOffset} len={writeLength} before={lengthBefore} -> DISK_FULL");
             FsTracer.Trace("WriteFile-FULL", fileName, $"wo={writeOffset} buf={buffer.Length}");
             return V(WriteResult.Error(NtStatus.DiskFull));
         }
 
         node.LastWriteTime = DateTime.UtcNow;
 
+        DiagLog(fileName, $"WRITE off={writeOffset} len={writeLength} before={lengthBefore} after={node.Content.Length} written={written} cio={(constrainedIo ? 1 : 0)} eof={(writeToEndOfFile ? 1 : 0)}");
         FsTracer.Trace("WriteFile", fileName,
             $"cio={(constrainedIo ? 1 : 0)} wteof={(writeToEndOfFile ? 1 : 0)} off={offset} wo={writeOffset} buf={buffer.Length} written={written} lenBefore={lengthBefore} lenAfter={node.Content.Length}");
 
@@ -415,9 +432,13 @@ public sealed unsafe class WinFspRamAdapter : IFileSystem
 
         long sizeBefore = node.Content.Length;
         if (!node.Content.SetLength((long)newSize))
+        {
+            DiagLog(fileName, $"SETSIZE new={newSize} before={sizeBefore} -> DISK_FULL");
             return V(FsResult.Error(NtStatus.DiskFull));
+        }
 
         node.LastWriteTime = DateTime.UtcNow;
+        DiagLog(fileName, $"SETSIZE new={newSize} before={sizeBefore} after={node.Content.Length}");
         FsTracer.Trace("SetFileSize", fileName, $"newSize={newSize} sizeBefore={sizeBefore}");
         Notify(FileNotify.ChangeSize | FileNotify.ChangeLastWrite, FileNotify.ActionModified, fileName);
         return V(FsResult.Success(MakeFileInfo(node)));

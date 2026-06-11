@@ -161,6 +161,9 @@ public class ChaosTests(RamDriveFixture fx)
                         $"[INTEGRITY-{(legit ? "TESTRACE" : "REALBUG")}] {fi.Path} " +
                         $"expSize={snap.ExpSize} gotLen={data.Length} sizeMatch={data.Length == snap.ExpSize} " +
                         $"diskMatchesAKnownWrite={legit} knownWrites={fi.KnownWriteCount}{forensic}");
+                    if (!legit && RamDrive.Core.FileSystem.WinFspRamAdapter.DiagOps.TryGetValue(
+                            System.IO.Path.GetFileName(fi.Path), out var ops))
+                        Console.Error.WriteLine($"[OPLOG {System.IO.Path.GetFileName(fi.Path)}]\n    " + string.Join("\n    ", ops));
                 }
                 break;
             }

@@ -67,7 +67,7 @@ jobs:
         shell: pwsh
         env:
           CHAOS_DURATION_SEC: "90"      # TEMP diagnostic: longer fuzz to surface the rare integrity race
-          RAMDRIVE_DISABLE_CACHE: "1"   # TEMP diagnostic: kernel cache OFF — does the corruption vanish?
+          CORRUPT_DURATION_SEC: "90"    # TEMP diagnostic: confound-free real-corruption detector
         run: |
           $projects = @(
             "tests/RamDrive.Core.Tests/RamDrive.Core.Tests.csproj",
