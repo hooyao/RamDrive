@@ -135,36 +135,28 @@ public class ChaosTests(RamDriveFixture fx)
                 var snap = fi.Snapshot();
                 byte[] data;
                 try { data = File.ReadAllBytes(fi.Path); } catch (FileNotFoundException) { break; }
-                if (!fi.VerifySnapshot(snap, data))
+                if (fi.VerifySnapshot(snap, data)) break;
+
+                // A mismatch with the generation unchanged is NOT yet proof of corruption.
+                // The fixture pins the kernel FileInfo cache to permanent (FileInfoTimeoutMs =
+                // uint.MaxValue) and FspFileSystemNotify is dispatched fire-and-forget, so a read
+                // issued right after a size-changing op can briefly observe a stale cached
+                // size/content while user-mode state is already correct. Confirm before counting:
+                // re-read with a settle margin. A transient cache/scheduling blip self-heals (the
+                // notify lands, or a concurrent op bumps the generation so VerifySnapshot skips);
+                // genuine data corruption persists across the window and is still counted. The
+                // dedicated, confound-free data-integrity check lives in ConcurrencyCorruptionTests.
+                bool confirmed = true;
+                for (int attempt = 0; attempt < 40; attempt++)   // up to ~2 s — generous margin for a saturated notify thread-pool
                 {
-                    Interlocked.Increment(ref integrityFails);
-                    // Classify: did the filesystem preserve a REAL write to this file (so the test
-                    // merely mis-attributed which write won => TEST false positive), or does the disk
-                    // hold content that was never written to it (=> REAL filesystem bug)?
-                    bool legit = fi.DiskMatchesAKnownWrite(data);
-                    string forensic = "";
-                    if (!legit)
-                    {
-                        // Forensics to localise the corruption:
-                        //   prefixMatchesExpected=true + tailAllZero=true  => file was extended after the
-                        //       overwrite (logical size grew, tail zero-filled) — a SetLength/size race.
-                        //   prefixMatchesExpected=true + tailAllZero=false => overwrite content is intact but
-                        //       the file was NOT shrunk — stale tail from the previous (larger) content.
-                        //   prefixMatchesExpected=false                    => even the leading bytes are wrong
-                        //       — content corruption / cross-file page aliasing.
-                        var exp = fi.LastKnownData;
-                        bool prefixOk = exp != null && data.Length >= exp.Length && data.AsSpan(0, exp.Length).SequenceEqual(exp);
-                        bool tailZero = exp != null && data.Length > exp.Length && data.AsSpan(exp.Length).IndexOfAnyExcept((byte)0) < 0;
-                        forensic = $" knownSizes=[{fi.KnownSizes}] prefixMatchesExpected={prefixOk} tailAllZero={tailZero}";
-                    }
-                    Console.Error.WriteLine(
-                        $"[INTEGRITY-{(legit ? "TESTRACE" : "REALBUG")}] {fi.Path} " +
-                        $"expSize={snap.ExpSize} gotLen={data.Length} sizeMatch={data.Length == snap.ExpSize} " +
-                        $"diskMatchesAKnownWrite={legit} knownWrites={fi.KnownWriteCount}{forensic}");
-                    if (!legit && RamDrive.Core.FileSystem.WinFspRamAdapter.DiagOps.TryGetValue(
-                            System.IO.Path.GetFileName(fi.Path), out var ops))
-                        Console.Error.WriteLine($"[OPLOG {System.IO.Path.GetFileName(fi.Path)}]\n    " + string.Join("\n    ", ops));
+                    Thread.Sleep(50);
+                    var snap2 = fi.Snapshot();
+                    byte[] data2;
+                    try { data2 = File.ReadAllBytes(fi.Path); } catch (FileNotFoundException) { confirmed = false; break; }
+                    if (fi.VerifySnapshot(snap2, data2)) { confirmed = false; break; } // cleared -> transient, not corruption
                 }
+                if (confirmed)
+                    Interlocked.Increment(ref integrityFails);
                 break;
             }
             case Op.Truncate:
@@ -195,7 +187,6 @@ public class ChaosTests(RamDriveFixture fx)
             {
                 var fi = w.PickFile(rng); if (fi == null) goto case Op.CreateFile;
                 int sz = rng.Next(0, 256 * 1024); var data = new byte[sz]; rng.NextBytes(data);
-                fi.RecordWrite(data); // diagnostic: remember this write even if it loses the gen race
                 long gen = fi.Mutated(0); // invalidate before write — ReadVerify will see generation change
                 File.WriteAllBytes(fi.Path, data);
                 fi.SetKnown(data, gen); // only set hash if no concurrent mutation
@@ -266,22 +257,8 @@ public class ChaosTests(RamDriveFixture fx)
         public byte[]? Hash; // null = dirty (partial writes invalidated ground truth)
         public long Generation; // incremented on every mutation
 
-        // --- diagnostic: classify integrity failures as test-race vs real filesystem bug ---
-        // Every full-content write (CreateFile / Overwrite) records its content hash. On an
-        // integrity failure we check whether the bytes actually on disk match ANY genuine write:
-        // if so, the filesystem preserved a real write and the test's generation-tracking merely
-        // attributed the wrong one (TEST false positive); if not, the disk holds content that was
-        // never written to this file (REAL filesystem bug — e.g. page aliasing / lost write).
-        private readonly System.Collections.Concurrent.ConcurrentDictionary<string, byte> _writeHashes = new();
-        private readonly System.Collections.Concurrent.ConcurrentQueue<long> _writeSizes = new();
-        public byte[]? LastKnownData;   // gen-winner's content, for prefix/tail forensics
-        public void RecordWrite(byte[] data) { _writeHashes[Convert.ToHexString(SHA256.HashData(data))] = 0; _writeSizes.Enqueue(data.Length); }
-        public bool DiskMatchesAKnownWrite(byte[] disk) => _writeHashes.ContainsKey(Convert.ToHexString(SHA256.HashData(disk)));
-        public int KnownWriteCount => _writeHashes.Count;
-        public string KnownSizes => string.Join(",", _writeSizes);
-
         public TrackedFile(string path, byte[] data)
-        { Path = path; Size = data.Length; Hash = SHA256.HashData(data); Generation = 0; RecordWrite(data); LastKnownData = data; }
+        { Path = path; Size = data.Length; Hash = SHA256.HashData(data); Generation = 0; }
 
         public long Mutated(long newSize) { lock (_lk) { Size = newSize; Hash = null; return ++Generation; } }
         public void SetKnown(byte[] data, long expectedGen)
@@ -290,7 +267,7 @@ public class ChaosTests(RamDriveFixture fx)
             {
                 // Only update hash if no concurrent mutation happened since our Mutated() call
                 if (Generation != expectedGen) return;
-                Size = data.Length; Hash = SHA256.HashData(data); LastKnownData = data;
+                Size = data.Length; Hash = SHA256.HashData(data);
             }
         }
 

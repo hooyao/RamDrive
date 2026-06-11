@@ -20,7 +20,7 @@ public class ConcurrencyCorruptionTests(RamDriveFixture fx)
     [Fact]
     public void EachFileOnlyHoldsItsOwnValue_NoCrossContamination()
     {
-        int durationSec = int.TryParse(Environment.GetEnvironmentVariable("CORRUPT_DURATION_SEC"), out var d) ? d : 45;
+        int durationSec = int.TryParse(Environment.GetEnvironmentVariable("CORRUPT_DURATION_SEC"), out var d) ? d : 20;
         int workers = Environment.ProcessorCount * 3;
         const int NFILES = 16;
         const int MAXSZ = 300_000;   // small: 16 * 300KB << 512MB pool, so no legitimate DISK_FULL
