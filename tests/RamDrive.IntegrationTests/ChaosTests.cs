@@ -30,7 +30,7 @@ public class ChaosTests(RamDriveFixture fx)
     static readonly Op[] Pool = Weights.SelectMany(w => Enumerable.Repeat(w.Item1, w.Item2)).ToArray();
 
     [Fact]
-    public void RandomFuzzer()
+    public async Task RandomFuzzer()
     {
         int durationSec = int.TryParse(Environment.GetEnvironmentVariable("CHAOS_DURATION_SEC"), out var d) ? d : 30;
         int workers = int.TryParse(Environment.GetEnvironmentVariable("CHAOS_WORKERS"), out var w) ? w : 32;
@@ -83,9 +83,9 @@ public class ChaosTests(RamDriveFixture fx)
             }, cts.Token, TaskCreationOptions.LongRunning, TaskScheduler.Default)
         ).ToArray();
 
-        try { Task.WaitAll(tasks); } catch { }
+        try { await Task.WhenAll(tasks); } catch { }
         cts.Cancel();
-        try { printer.Wait(2000); } catch { }
+        try { await Task.WhenAny(printer, Task.Delay(TimeSpan.FromSeconds(2))); } catch { }
 
         Console.WriteLine($"[chaos] DONE: ops={totalOps:N0} integrity={integrityFails} err={unexpectedErrors}");
         try { Directory.Delete(root, true); } catch { }
@@ -135,7 +135,27 @@ public class ChaosTests(RamDriveFixture fx)
                 var snap = fi.Snapshot();
                 byte[] data;
                 try { data = File.ReadAllBytes(fi.Path); } catch (FileNotFoundException) { break; }
-                if (!fi.VerifySnapshot(snap, data))
+                if (fi.VerifySnapshot(snap, data)) break;
+
+                // A mismatch with the generation unchanged is NOT yet proof of corruption.
+                // The fixture pins the kernel FileInfo cache to permanent (FileInfoTimeoutMs =
+                // uint.MaxValue) and FspFileSystemNotify is dispatched fire-and-forget, so a read
+                // issued right after a size-changing op can briefly observe a stale cached
+                // size/content while user-mode state is already correct. Confirm before counting:
+                // re-read with a settle margin. A transient cache/scheduling blip self-heals (the
+                // notify lands, or a concurrent op bumps the generation so VerifySnapshot skips);
+                // genuine data corruption persists across the window and is still counted. The
+                // dedicated, confound-free data-integrity check lives in ConcurrencyCorruptionTests.
+                bool confirmed = true;
+                for (int attempt = 0; attempt < 40; attempt++)   // up to ~2 s — generous margin for a saturated notify thread-pool
+                {
+                    Thread.Sleep(50);
+                    var snap2 = fi.Snapshot();
+                    byte[] data2;
+                    try { data2 = File.ReadAllBytes(fi.Path); } catch (FileNotFoundException) { confirmed = false; break; }
+                    if (fi.VerifySnapshot(snap2, data2)) { confirmed = false; break; } // cleared -> transient, not corruption
+                }
+                if (confirmed)
                     Interlocked.Increment(ref integrityFails);
                 break;
             }

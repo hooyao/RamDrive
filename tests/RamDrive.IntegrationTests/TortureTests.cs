@@ -232,7 +232,7 @@ public class TortureTests(RamDriveFixture fx) : IDisposable
     }
 
     [Fact]
-    public void CapacityPressure()
+    public async Task CapacityPressure()
     {
         EnsureRoot();
         var cap = Path.Combine(_root, "cap"); Directory.CreateDirectory(cap);
@@ -254,7 +254,8 @@ public class TortureTests(RamDriveFixture fx) : IDisposable
             try { File.WriteAllBytes(Path.Combine(cap, "overflow.dat"), new byte[chunk * 2]); }
             catch (IOException) { }
         });
-        task.Wait(TimeSpan.FromSeconds(5)).Should().BeTrue("write under capacity pressure should not hang");
+        var completed = await Task.WhenAny(task, Task.Delay(TimeSpan.FromSeconds(5))) == task;
+        completed.Should().BeTrue("write under capacity pressure should not hang");
 
         // Verify existing files
         for (int i = 0; i < Math.Min(count, 5); i++)

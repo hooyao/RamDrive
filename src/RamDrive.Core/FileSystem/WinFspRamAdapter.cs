@@ -554,21 +554,35 @@ public sealed unsafe class WinFspRamAdapter : IFileSystem
 
         uint bytesTransferred = 0;
 
+        // NTFS / memfs convention: every NON-ROOT directory enumerates "." (itself) and
+        // ".." (its parent) ahead of its children. Real NTFS and WinFsp's reference memfs
+        // both do this. Omitting them makes an EMPTY directory enumerate to zero records;
+        // the kernel then answers the first NtQueryDirectoryFile with STATUS_NO_SUCH_FILE,
+        // which libuv (Node.js / Electron — e.g. VS Code's updater doing mkdir-then-readdir)
+        // surfaces as ENOENT. .NET's Directory.* and PowerShell swallow that status and
+        // return an empty set, which is why the .NET-based torture/chaos suites never caught
+        // it — see DirectoryEnumerationTests for a FindFirstFile-level regression.
+        var dir = Node(info) ?? _fs.FindNode(fileName);
+        var parent = dir?.Parent;            // null parent == root; NTFS root has no "." / ".."
+        if (parent != null)
+        {
+            if (marker == null && !AddDirEntry(dir!, ".", buffer, length, &bytesTransferred))
+                return V(ReadDirectoryResult.Success(bytesTransferred));
+            if ((marker == null || marker == ".") && !AddDirEntry(parent, "..", buffer, length, &bytesTransferred))
+                return V(ReadDirectoryResult.Success(bytesTransferred));
+            // "." / ".." already emitted at this resume point — list all children fresh.
+            if (marker is "." or "..")
+                marker = null;
+        }
+
+        // pattern is applied by WinFsp internally (PassQueryDirectoryPattern is not set); no filtering here.
         foreach (var child in children)
         {
             // marker: skip entries <= marker (sorted by name, case-insensitive)
             if (marker != null && string.Compare(child.Name, marker, StringComparison.OrdinalIgnoreCase) <= 0)
                 continue;
 
-            // pattern filter (null = match all)
-            // WinFsp passes pattern when PassQueryDirectoryPattern is set; typically null for us
-            // Skip pattern matching — let WinFsp handle it internally
-
-            var dirInfo = new FspDirInfo();
-            dirInfo.FileInfo = MakeFileInfo(child);
-            dirInfo.SetFileName(child.Name);
-
-            if (!WinFspFileSystem.AddDirInfo(&dirInfo, buffer, length, &bytesTransferred))
+            if (!AddDirEntry(child, child.Name, buffer, length, &bytesTransferred))
                 return V(ReadDirectoryResult.Success(bytesTransferred)); // buffer full
         }
 
@@ -631,6 +645,21 @@ public sealed unsafe class WinFspRamAdapter : IFileSystem
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private static ulong ToFileTime(DateTime dt)
         => (ulong)dt.ToFileTimeUtc();
+
+    /// <summary>
+    /// Append a single directory entry (named <paramref name="name"/>, carrying
+    /// <paramref name="node"/>'s metadata) to the WinFsp directory buffer. Used for the
+    /// synthetic "." / ".." entries as well as real children. Returns <c>false</c> when the
+    /// buffer is full (caller stops and reports what fit so far for marker-based resume).
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static bool AddDirEntry(FileNode node, string name, nint buffer, uint length, uint* pBytesTransferred)
+    {
+        var dirInfo = new FspDirInfo();
+        dirInfo.FileInfo = MakeFileInfo(node);
+        dirInfo.SetFileName(name);
+        return WinFspFileSystem.AddDirInfo(&dirInfo, buffer, length, pBytesTransferred);
+    }
 
     // Zero-alloc ValueTask wrappers — synchronous completion, no Task boxing
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
