@@ -18,7 +18,7 @@ namespace RamDrive.IntegrationTests;
 public class ConcurrencyCorruptionTests(RamDriveFixture fx)
 {
     [Fact]
-    public void EachFileOnlyHoldsItsOwnValue_NoCrossContamination()
+    public async Task EachFileOnlyHoldsItsOwnValue_NoCrossContamination()
     {
         int durationSec = int.TryParse(Environment.GetEnvironmentVariable("CORRUPT_DURATION_SEC"), out var d) ? d : 20;
         int workers = Environment.ProcessorCount * 3;
@@ -110,7 +110,7 @@ public class ConcurrencyCorruptionTests(RamDriveFixture fx)
             }
         }, cts.Token, TaskCreationOptions.LongRunning, TaskScheduler.Default)).ToArray();
 
-        try { Task.WaitAll(tasks); } catch { }
+        try { await Task.WhenAll(tasks); } catch { }
         try { Directory.Delete(root, true); } catch { }
 
         Console.WriteLine($"[corrupt] reads={reads} ioerr={ioerr} corruptions={corruptions}");

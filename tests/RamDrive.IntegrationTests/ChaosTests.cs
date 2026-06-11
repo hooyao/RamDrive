@@ -30,7 +30,7 @@ public class ChaosTests(RamDriveFixture fx)
     static readonly Op[] Pool = Weights.SelectMany(w => Enumerable.Repeat(w.Item1, w.Item2)).ToArray();
 
     [Fact]
-    public void RandomFuzzer()
+    public async Task RandomFuzzer()
     {
         int durationSec = int.TryParse(Environment.GetEnvironmentVariable("CHAOS_DURATION_SEC"), out var d) ? d : 30;
         int workers = int.TryParse(Environment.GetEnvironmentVariable("CHAOS_WORKERS"), out var w) ? w : 32;
@@ -83,9 +83,9 @@ public class ChaosTests(RamDriveFixture fx)
             }, cts.Token, TaskCreationOptions.LongRunning, TaskScheduler.Default)
         ).ToArray();
 
-        try { Task.WaitAll(tasks); } catch { }
+        try { await Task.WhenAll(tasks); } catch { }
         cts.Cancel();
-        try { printer.Wait(2000); } catch { }
+        try { await Task.WhenAny(printer, Task.Delay(TimeSpan.FromSeconds(2))); } catch { }
 
         Console.WriteLine($"[chaos] DONE: ops={totalOps:N0} integrity={integrityFails} err={unexpectedErrors}");
         try { Directory.Delete(root, true); } catch { }
