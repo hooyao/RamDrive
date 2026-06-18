@@ -18,6 +18,12 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          # Need full history + all tags so we can compute the previous release tag
+          # for --notes-start-tag (shallow checkout has no tags, which makes
+          # gh's --generate-notes pick the wrong starting point).
+          fetch-depth: 0
+          fetch-tags: true
 
       - name: Parse version from tag
         id: version
@@ -126,10 +132,27 @@ jobs:
           $prerelease = "${{ steps.version.outputs.PRERELEASE }}"
           $installerX64   = Get-ChildItem "installer-output/RamDrive-$version-x64-setup.exe"   | Select-Object -First 1
           $installerArm64 = Get-ChildItem "installer-output/RamDrive-$version-arm64-setup.exe" | Select-Object -First 1
+
+          # Compute the previous stable release tag so the auto-generated changelog
+          # covers exactly this release's commits. Without an explicit start tag,
+          # gh's --generate-notes heuristically picks a starting point and can reach
+          # too far back (e.g. v0.4.2..v0.4.6 instead of v0.4.5..v0.4.6).
+          $prevTag = git tag --list "v*" --sort=-v:refname |
+            Where-Object { $_ -ne "v$version" -and $_ -notmatch '-(beta|alpha|rc|pre)' } |
+            Select-Object -First 1
+
           $ghArgs = @(
             "release", "create", "v$version",
             "--title", "RamDrive $version",
-            "--generate-notes",
+            "--generate-notes"
+          )
+          if ($prevTag) {
+            Write-Host "Changelog start tag: $prevTag"
+            $ghArgs += @("--notes-start-tag", $prevTag)
+          } else {
+            Write-Host "No previous stable tag found; letting gh auto-select."
+          }
+          $ghArgs += @(
             "RamDrive-$version-x64.zip",
             "RamDrive-$version-arm64.zip",
             $installerX64.FullName,
