@@ -1,6 +1,7 @@
 using System.Runtime.CompilerServices;
 using System.Runtime.Versioning;
 using System.Security.AccessControl;
+using System.Security.Principal;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using RamDrive.Core.Configuration;
@@ -105,6 +106,12 @@ public sealed unsafe class WinFspRamAdapter : IFileSystem
         host.UnicodeOnDisk = true;
         host.PersistentAcls = true;
         host.PostCleanupWhenModifiedOnly = true;
+        // Non-zero volume serial. std::filesystem::copy_file compares (VolumeSerialNumber, file id)
+        // to detect "source and destination are the same file". A zero serial combined with a zero
+        // file id makes EVERY pair of files look identical, so a same-volume copy_file throws
+        // std::errc::file_exists — this is exactly the dotTrace ETW-collector deploy failure.
+        // Pair this with a unique per-node IndexNumber in MakeFileInfo. See spec file-id-uniqueness.
+        host.VolumeSerialNumber = 0x52414D44; // "RAMD"
         host.FileSystemName = "NTFS";
         return NtStatus.Success;
     }
@@ -168,6 +175,44 @@ public sealed unsafe class WinFspRamAdapter : IFileSystem
                 path);
         }
         return _rootSecurityDescriptorBytes;
+    }
+
+    // ─── Owner-change rejection (NTFS owner-assignment approximation) ───
+    //
+    // SECURITY_INFORMATION bit 0x1 == OWNER_SECURITY_INFORMATION.
+    private const uint OWNER_SECURITY_INFORMATION = 0x00000001;
+
+    // WinFsp.Native's NtStatus does not define this. Value confirmed by winfsp's own .NET
+    // binding (winfsp src/dotnet/FileSystemBase+Const.cs:319): STATUS_INVALID_OWNER = 0xC000005A,
+    // which WinFsp maps to Win32 ERROR_INVALID_OWNER (1307).
+    private const int STATUS_INVALID_OWNER = unchecked((int)0xC000005A);
+
+    /// <summary>
+    /// Approximate NTFS owner-assignment privilege enforcement. WinFsp does not surface the caller
+    /// token to the SetSecurity callback (kernel <c>Req.SetSecurity</c> has no AccessToken field and
+    /// <c>FspFileSystemOpEnter</c> does not impersonate), so we cannot test
+    /// <c>SeRestore</c>/<c>SeTakeOwnership</c>. Instead we reject any request that would CHANGE the
+    /// owner SID: on real NTFS a non-privileged caller's owner reassignment fails atomically with
+    /// <c>STATUS_INVALID_OWNER</c> (1307), which also prevents the bundled DACL change — the property
+    /// that keeps an object deletable by its creator. Returns <c>true</c> when the request must be
+    /// rejected.
+    ///
+    /// <para>LOCKSTEP: an identical rule lives in
+    /// <c>RamDrive.Diagnostics.MemfsReference.MemfsReferenceFs.SetFileSecurity</c>. Both MUST return
+    /// the same NTSTATUS for the same input or <c>DifferentialAdapter</c> /
+    /// <c>Comparators.CompareStatus("SetFileSecurity")</c> throws. See spec
+    /// <c>security-owner-enforcement</c>.</para>
+    /// </summary>
+    private static bool IsRejectedOwnerChange(uint securityInformation, byte[] currentSd, RawSecurityDescriptor modification)
+    {
+        if ((securityInformation & OWNER_SECURITY_INFORMATION) == 0)
+            return false;                                   // owner not being touched → never reject
+        SecurityIdentifier? newOwner = modification.Owner;
+        if (newOwner == null)
+            return false;                                   // OWNER bit set but no owner SID → nothing to change
+        SecurityIdentifier? curOwner = new RawSecurityDescriptor(currentSd, 0).Owner;
+        // Static Equals handles a null current owner; SecurityIdentifier overrides value equality.
+        return !Equals(newOwner, curOwner);                 // different owner → reject; same → idempotent no-op
     }
 
     // ═══════════════════════════════════════════
@@ -443,10 +488,24 @@ public sealed unsafe class WinFspRamAdapter : IFileSystem
         if (node == null)
             return NtStatus.ObjectNameNotFound;
 
-        var existing = node.SecurityDescriptor != null
-            ? new RawSecurityDescriptor(node.SecurityDescriptor, 0)
-            : new RawSecurityDescriptor(RootSddl);
+        // Effective current SD: fall back to the root SD if the node somehow has none (defensive;
+        // the no-null-SD structural invariant means this should be unreachable). Threading the same
+        // bytes into both the owner-change guard and the merge keeps them consistent.
+        byte[] currentSd = node.SecurityDescriptor ?? _rootSecurityDescriptorBytes;
         var modification = new RawSecurityDescriptor(modificationDescriptor, 0);
+
+        // NTFS oracle: a non-privileged caller cannot reassign the owner. WinFsp does not pass the
+        // caller token here, so we approximate by rejecting any owner *change*. The failure is
+        // atomic — the DACL/GROUP/SACL carried in the same request must NOT be applied either. This
+        // is what keeps a directory deletable by its creator (e.g. dotTrace's jetbrainsproc_<GUID>
+        // temp dirs). See spec security-owner-enforcement.
+        if (IsRejectedOwnerChange(securityInformation, currentSd, modification))
+        {
+            FsTracer.Trace("SetFileSecurity-OwnerRejected", fileName, $"secInfo=0x{securityInformation:X}");
+            return STATUS_INVALID_OWNER;
+        }
+
+        var existing = new RawSecurityDescriptor(currentSd, 0);
 
         // Merge based on SECURITY_INFORMATION flags
         if ((securityInformation & 1) != 0) existing.Owner = modification.Owner;       // OWNER_SECURITY_INFORMATION
@@ -457,6 +516,7 @@ public sealed unsafe class WinFspRamAdapter : IFileSystem
         var result = new byte[existing.BinaryLength];
         existing.GetBinaryForm(result, 0);
         node.SecurityDescriptor = result;
+        FsTracer.Trace("SetFileSecurity", fileName, $"secInfo=0x{securityInformation:X}");
         return NtStatus.Success;
     }
 
@@ -640,6 +700,10 @@ public sealed unsafe class WinFspRamAdapter : IFileSystem
         LastAccessTime = ToFileTime(node.LastAccessTime),
         LastWriteTime = ToFileTime(node.LastWriteTime),
         ChangeTime = ToFileTime(node.LastWriteTime), // reuse LastWriteTime
+        // Unique file id. Without it every file reports id 0, and a same-volume
+        // std::filesystem::copy_file treats distinct files as identical (file_exists). See
+        // FileNode.IndexNumber and spec file-id-uniqueness.
+        IndexNumber = node.IndexNumber,
     };
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]

@@ -31,6 +31,19 @@ public sealed class FileNode : IDisposable
 
     public FileNode? Parent { get; set; }
 
+    /// <summary>
+    /// Unique, stable per-node file id (NTFS-style file index / inode number). Surfaced to WinFsp
+    /// as <c>FspFileInfo.IndexNumber</c>. MUST be unique across all live nodes: the CRT/STL
+    /// <c>std::filesystem::copy_file</c> (and Win32 same-volume copy fast paths) compare
+    /// <c>(VolumeSerialNumber, file id)</c> of source and destination to detect "copying a file onto
+    /// itself". If every node reported id 0, a same-volume copy of two distinct files would be
+    /// rejected with <c>std::errc::file_exists</c> — the dotTrace ETW-collector deploy failure.
+    /// Allocated from a monotonic counter starting at 1 (0 is reserved / "unknown").
+    /// </summary>
+    public ulong IndexNumber { get; }
+
+    private static long _nextIndexNumber;
+
     public long Size => Content?.Length ?? 0;
 
     /// <summary>Actual bytes backed by allocated pages. 0 for directories and sparse regions.</summary>
@@ -41,6 +54,7 @@ public sealed class FileNode : IDisposable
         Name = name;
         NodeType = nodeType;
         Content = content;
+        IndexNumber = (ulong)System.Threading.Interlocked.Increment(ref _nextIndexNumber);
         var now = DateTime.UtcNow;
         CreationTime = now;
         LastWriteTime = now;
