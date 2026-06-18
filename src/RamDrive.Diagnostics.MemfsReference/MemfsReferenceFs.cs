@@ -21,6 +21,7 @@ using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using System.Runtime.Versioning;
 using System.Security.AccessControl;
+using System.Security.Principal;
 using WinFsp.Native;
 
 namespace RamDrive.Diagnostics.MemfsReference;
@@ -35,12 +36,22 @@ public sealed unsafe class MemfsReferenceFs : IFileSystem
     // memfs default RootSddl when no -S flag is passed (memfs-main.c via MemfsCreateFunnel).
     private const string DefaultRootSddl = "O:BAG:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;WD)";
 
+    // SECURITY_INFORMATION bit 0x1 == OWNER_SECURITY_INFORMATION.
+    private const uint OWNER_SECURITY_INFORMATION = 0x00000001;
+    // WinFsp.Native's NtStatus does not define this. Value confirmed by winfsp's own .NET binding
+    // (winfsp src/dotnet/FileSystemBase+Const.cs:319): STATUS_INVALID_OWNER = 0xC000005A.
+    private const int STATUS_INVALID_OWNER = unchecked((int)0xC000005A);
+
     private readonly long _capacityBytes;
     private readonly ulong _maxFileSize;
     private readonly SortedDictionary<string, MemfsNode> _nodes;
     private readonly object _mapLock = new();
     private long _nextIndexNumber = 1;
     private string _volumeLabel = "MEMFS";
+
+    // Cached root SD bytes — used as the defensive fallback "current SD" in SetFileSecurity so the
+    // owner-change helper has a stable signature matching the production adapter.
+    private readonly byte[] _defaultRootSdBytes;
 
     public MemfsReferenceFs(long capacityMb)
     {
@@ -54,6 +65,7 @@ public sealed unsafe class MemfsReferenceFs : IFileSystem
         var sdBytes = new byte[sd.BinaryLength];
         sd.GetBinaryForm(sdBytes, 0);
         root.FileSecurity = sdBytes;
+        _defaultRootSdBytes = sdBytes;
         _nodes.Add(root.FileName, root);
         Interlocked.Increment(ref root.RefCount);
     }
@@ -133,10 +145,17 @@ public sealed unsafe class MemfsReferenceFs : IFileSystem
     {
         var n = N(info);
         if (n == null) return NtStatus.ObjectNameNotFound;
-        var existing = n.FileSecurity != null
-            ? new RawSecurityDescriptor(n.FileSecurity, 0)
-            : new RawSecurityDescriptor(DefaultRootSddl);
+
+        byte[] currentSd = n.FileSecurity ?? _defaultRootSdBytes;
         var modification = new RawSecurityDescriptor(modificationDescriptor, 0);
+
+        // LOCKSTEP with WinFspRamAdapter.SetFileSecurity: NTFS rejects owner reassignment by a
+        // non-privileged caller (STATUS_INVALID_OWNER, atomic). Both adapters MUST return the same
+        // NTSTATUS for the same input or Comparators.CompareStatus("SetFileSecurity") throws.
+        if (IsRejectedOwnerChange(securityInformation, currentSd, modification))
+            return STATUS_INVALID_OWNER;
+
+        var existing = new RawSecurityDescriptor(currentSd, 0);
         if ((securityInformation & 1) != 0) existing.Owner = modification.Owner;
         if ((securityInformation & 2) != 0) existing.Group = modification.Group;
         if ((securityInformation & 4) != 0) existing.DiscretionaryAcl = modification.DiscretionaryAcl;
@@ -145,6 +164,19 @@ public sealed unsafe class MemfsReferenceFs : IFileSystem
         existing.GetBinaryForm(result, 0);
         n.FileSecurity = result;
         return NtStatus.Success;
+    }
+
+    // LOCKSTEP: identical rule in WinFspRamAdapter.IsRejectedOwnerChange. Reject any owner *change*
+    // (OWNER bit set AND new owner SID differs from current) to approximate NTFS owner-assignment
+    // privilege, which WinFsp cannot enforce (no caller token at SetSecurity). See spec
+    // security-owner-enforcement.
+    private static bool IsRejectedOwnerChange(uint securityInformation, byte[] currentSd, RawSecurityDescriptor modification)
+    {
+        if ((securityInformation & OWNER_SECURITY_INFORMATION) == 0) return false;
+        SecurityIdentifier? newOwner = modification.Owner;
+        if (newOwner == null) return false;
+        SecurityIdentifier? curOwner = new RawSecurityDescriptor(currentSd, 0).Owner;
+        return !Equals(newOwner, curOwner);
     }
 
     public ValueTask<CreateResult> CreateFile(string fileName, uint createOptions, uint grantedAccess,
