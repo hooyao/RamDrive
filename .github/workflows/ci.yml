@@ -16,6 +16,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       code: ${{ steps.filter.outputs.code }}
+      installer: ${{ steps.filter.outputs.installer }}
     steps:
       - uses: actions/checkout@v4
 
@@ -32,6 +33,9 @@ jobs:
               - 'global.json'
               - 'Directory.Build.props'
               - 'Directory.Packages.props'
+              - '.github/workflows/ci.yml'
+            installer:
+              - 'setup/**'
               - '.github/workflows/ci.yml'
 
   build-and-test:
@@ -129,3 +133,148 @@ jobs:
             exit 1
           }
           Write-Host "ARM64 cross-publish OK: $((Get-Item ./publish-aot-arm64-ci/RamDrive.exe).Length) bytes"
+
+  installer:
+    needs: changes
+    if: needs.changes.outputs.installer == 'true'
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Inno Setup
+        shell: pwsh
+        run: |
+          choco install innosetup -y --no-progress
+          Write-Output "C:\Program Files (x86)\Inno Setup 6" >> $env:GITHUB_PATH
+
+      - name: Stage placeholder payload
+        shell: pwsh
+        run: |
+          # ISCC only checks that each [Files] Source exists; it never executes the
+          # exe or inspects its contents. So we stage zero-cost placeholders instead
+          # of running the ~10-min dual-arch AOT publish. This job validates the .iss
+          # structure and the [Code] Pascal syntax, not the shipped binaries.
+          New-Item -ItemType Directory -Force -Path publish-aot, publish-aot-arm64 | Out-Null
+          foreach ($dir in 'publish-aot', 'publish-aot-arm64') {
+            Set-Content -Path "$dir/RamDrive.exe" -Value 'placeholder'
+            Copy-Item src/RamDrive.Cli/appsettings.jsonc "$dir/appsettings.jsonc"
+          }
+          # The WinFsp MSI filename must match the WinFspMsi macro in RamDrive.iss.
+          $msi = (Select-String -Path setup/RamDrive.iss -Pattern '#define\s+WinFspMsi\s+"([^"]+)"').Matches[0].Groups[1].Value
+          Set-Content -Path "setup/$msi" -Value 'placeholder'
+          Write-Host "Staged placeholder MSI: setup/$msi"
+
+      - name: Compile installer (x64)
+        shell: pwsh
+        run: iscc.exe setup/RamDrive.iss
+
+      - name: Compile installer (arm64)
+        shell: pwsh
+        run: iscc.exe /DMyAppArch=arm64 setup/RamDrive.iss
+
+      - name: Verify installers produced
+        shell: pwsh
+        run: |
+          $exes = Get-ChildItem installer-output/*-setup.exe
+          if ($exes.Count -lt 2) {
+            Write-Error "Expected x64 + arm64 installers, found $($exes.Count)"
+            exit 1
+          }
+          $exes | ForEach-Object { Write-Host "OK: $($_.Name) ($($_.Length) bytes)" }
+
+  # Produces a REAL, installable x64 build as a downloadable artifact for PRs.
+  # Unlike the `installer` job above (which stages placeholders to validate only
+  # the .iss/Pascal syntax), this job runs the actual AOT publish, bundles the
+  # real WinFsp MSI, and compiles a setup.exe you can download and run. Mirrors
+  # the proven steps in release.yml, minus the GitHub Release upload.
+  package:
+    needs: changes
+    if: needs.changes.outputs.code == 'true' || needs.changes.outputs.installer == 'true'
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup .NET 10
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "10.0.x"
+
+      - name: Setup MSBuild
+        uses: microsoft/setup-msbuild@v3
+        with:
+          msbuild-architecture: x64
+
+      - name: Compute version
+        id: ver
+        shell: pwsh
+        run: |
+          # Cosmetic only: stamps the exe ProductVersion and the setup.exe
+          # filename / Add-Remove-Programs display. Not a real release version.
+          $version = "0.0.0-ci${{ github.run_number }}"
+          Write-Output "VERSION=$version" >> $env:GITHUB_OUTPUT
+          Write-Host "Package version: $version"
+
+      - name: Publish AOT executable (x64)
+        shell: pwsh
+        run: |
+          dotnet publish src/RamDrive.Cli/RamDrive.Cli.csproj `
+            -c Release -r win-x64 `
+            "-p:Version=${{ steps.ver.outputs.VERSION }}" `
+            -o ./publish-aot
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          if (-not (Test-Path "./publish-aot/RamDrive.exe")) {
+            Write-Error "AOT publish completed but RamDrive.exe is missing"
+            exit 1
+          }
+
+      - name: Download WinFsp MSI
+        shell: pwsh
+        run: |
+          # Architecture-universal MSI bundled by the installer (dontcopy flag).
+          # Keep the URL in sync with the WinFspMsi macro in setup/RamDrive.iss
+          # and release.yml.
+          Invoke-WebRequest `
+            -Uri "https://github.com/winfsp/winfsp/releases/download/v2.1/winfsp-2.1.25156.msi" `
+            -OutFile "setup/winfsp-2.1.25156.msi"
+
+      - name: Install Inno Setup
+        shell: pwsh
+        run: |
+          choco install innosetup -y --no-progress
+          Write-Output "C:\Program Files (x86)\Inno Setup 6" >> $env:GITHUB_PATH
+
+      - name: Stamp version into Inno Setup script
+        shell: pwsh
+        run: |
+          $version = "${{ steps.ver.outputs.VERSION }}"
+          (Get-Content setup/RamDrive.iss) -replace '#define MyAppVersion\s+".*"', "#define MyAppVersion   `"$version`"" |
+            Set-Content setup/RamDrive.iss
+
+      - name: Build Inno Setup installer (x64)
+        shell: pwsh
+        run: |
+          iscc.exe setup/RamDrive.iss
+          $setup = Get-ChildItem installer-output/*-setup.exe | Select-Object -First 1
+          if (-not $setup) {
+            Write-Error "ISCC ran but no setup.exe was produced"
+            exit 1
+          }
+          Write-Host "Built: $($setup.Name) ($($setup.Length) bytes)"
+
+      - name: Upload portable build (exe + appsettings)
+        uses: actions/upload-artifact@v4
+        with:
+          name: RamDrive-x64-portable
+          path: |
+            publish-aot/RamDrive.exe
+            publish-aot/appsettings.jsonc
+          retention-days: 14
+
+      - name: Upload installer (setup.exe)
+        uses: actions/upload-artifact@v4
+        with:
+          name: RamDrive-x64-installer
+          path: installer-output/*-setup.exe
+          retention-days: 14
