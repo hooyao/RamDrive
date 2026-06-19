@@ -16,6 +16,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       code: ${{ steps.filter.outputs.code }}
+      installer: ${{ steps.filter.outputs.installer }}
     steps:
       - uses: actions/checkout@v4
 
@@ -32,6 +33,9 @@ jobs:
               - 'global.json'
               - 'Directory.Build.props'
               - 'Directory.Packages.props'
+              - '.github/workflows/ci.yml'
+            installer:
+              - 'setup/**'
               - '.github/workflows/ci.yml'
 
   build-and-test:
@@ -129,3 +133,52 @@ jobs:
             exit 1
           }
           Write-Host "ARM64 cross-publish OK: $((Get-Item ./publish-aot-arm64-ci/RamDrive.exe).Length) bytes"
+
+  installer:
+    needs: changes
+    if: needs.changes.outputs.installer == 'true'
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Inno Setup
+        shell: pwsh
+        run: |
+          choco install innosetup -y --no-progress
+          Write-Output "C:\Program Files (x86)\Inno Setup 6" >> $env:GITHUB_PATH
+
+      - name: Stage placeholder payload
+        shell: pwsh
+        run: |
+          # ISCC only checks that each [Files] Source exists; it never executes the
+          # exe or inspects its contents. So we stage zero-cost placeholders instead
+          # of running the ~10-min dual-arch AOT publish. This job validates the .iss
+          # structure and the [Code] Pascal syntax, not the shipped binaries.
+          New-Item -ItemType Directory -Force -Path publish-aot, publish-aot-arm64 | Out-Null
+          foreach ($dir in 'publish-aot', 'publish-aot-arm64') {
+            Set-Content -Path "$dir/RamDrive.exe" -Value 'placeholder'
+            Copy-Item src/RamDrive.Cli/appsettings.jsonc "$dir/appsettings.jsonc"
+          }
+          # The WinFsp MSI filename must match the WinFspMsi macro in RamDrive.iss.
+          $msi = (Select-String -Path setup/RamDrive.iss -Pattern '#define\s+WinFspMsi\s+"([^"]+)"').Matches[0].Groups[1].Value
+          Set-Content -Path "setup/$msi" -Value 'placeholder'
+          Write-Host "Staged placeholder MSI: setup/$msi"
+
+      - name: Compile installer (x64)
+        shell: pwsh
+        run: iscc.exe setup/RamDrive.iss
+
+      - name: Compile installer (arm64)
+        shell: pwsh
+        run: iscc.exe /DMyAppArch=arm64 setup/RamDrive.iss
+
+      - name: Verify installers produced
+        shell: pwsh
+        run: |
+          $exes = Get-ChildItem installer-output/*-setup.exe
+          if ($exes.Count -lt 2) {
+            Write-Error "Expected x64 + arm64 installers, found $($exes.Count)"
+            exit 1
+          }
+          $exes | ForEach-Object { Write-Host "OK: $($_.Name) ($($_.Length) bytes)" }
