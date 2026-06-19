@@ -705,28 +705,23 @@ var
 begin
   Result := True;
 
-  // Heads-up before we touch anything: if the installer's own working folder
-  // ({tmp}) is on a RAM disk, the install can still self-destruct. WinFsp is
-  // now installed *before* the RAM disk is unmounted (see PrepareToInstall), so
-  // the WinFsp MSI itself is safe — but PrepareToInstall then stops the service
-  // and unmounts the drive while {tmp} (extracted appsettings template, etc.)
-  // is still needed by the [Files] copy step that follows. We can't reliably
-  // detect "is this drive a RAM disk" from inside Inno Setup, so we ask the
-  // user — and if they want to relocate, we re-launch with TEMP overridden.
+  // Heads-up before we touch anything: WinFsp now installs *before* the RAM
+  // disk is unmounted (see PrepareToInstall), but PrepareToInstall then stops
+  // the service and unmounts the drive while {tmp} (and the installer EXE) are
+  // still needed by the [Files] copy step. If either lives on a RAM disk they
+  // vanish mid-install. We can't detect "is this a RAM disk" from Inno Setup,
+  // so we ask — and can relocate TEMP on the user's behalf.
   TempPath := ExpandConstant('{tmp}');
   Choice := TaskDialogMsgBox(
-    'TEMP folder check',
-    'If your TEMP folder is on a RAM disk, this installer may fail mid-install. ' +
-    'To swap binaries the installer stops the existing RamDrive service, which ' +
-    'unmounts the RAM disk — and that deletes the installer''s own working files ' +
-    '(in TEMP) before they are copied into place, leaving the system in a broken ' +
-    'state (service stopped, new binaries not installed).' + #13#10 + #13#10 +
-    'Current TEMP location:' + #13#10 +
-    '    ' + TempPath,
+    'RAM disk check',
+    'Install will fail if TEMP or this installer is on a RAM disk — stopping ' +
+    'RamDrive unmounts the disk and wipes those files mid-install.' + #13#10 + #13#10 +
+    'TEMP:      ' + TempPath + #13#10 +
+    'Installer: ' + ExpandConstant('{srcexe}'),
     mbError,
-    MB_YESNOCANCEL, ['Continue installation' + #13#10 + 'TEMP is NOT on a RAM disk — safe to proceed.',
-     'Pick a different TEMP folder...' + #13#10 + 'Browse to a folder on a non-RAM-disk drive; the installer will re-launch with TEMP set there.',
-     'Cancel' + #13#10 + 'Exit the installer.'],
+    MB_YESNOCANCEL, ['Continue' + #13#10 + 'Neither is on a RAM disk — proceed.',
+     'Move TEMP...' + #13#10 + 'Re-launch with TEMP on a non-RAM-disk drive.',
+     'Cancel' + #13#10 + 'Exit (move the installer off the RAM disk first).'],
     0);
 
   if Choice = IDYES then
