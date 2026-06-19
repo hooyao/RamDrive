@@ -27,11 +27,13 @@
   #define ArchSuffix       "-arm64"
   #define ArchAllowed      "arm64"
   #define ArchInstall64    "arm64"
+  #define WinFspDll        "winfsp-a64.dll"
 #elif MyAppArch == "x64"
   #define PublishDir       "..\publish-aot"
   #define ArchSuffix       "-x64"
   #define ArchAllowed      "x64compatible"
   #define ArchInstall64    "x64compatible"
+  #define WinFspDll        "winfsp-x64.dll"
 #else
   #error Unsupported MyAppArch. Use "x64" or "arm64".
 #endif
@@ -40,6 +42,10 @@
 ; Download from https://winfsp.dev/rel/ — the MSI is arch-universal and
 ; installs winfsp-x64.dll, winfsp-a64.dll, and winfsp-x86.dll regardless of OS.
 #define WinFspMsi      "winfsp-2.1.25156.msi"
+; Version of the bundled WinFsp MSI, "major.minor.build". The installer skips
+; the WinFsp install when an equal-or-newer version is already present. Keep
+; this in sync with WinFspMsi above (and with release.yml's download URL).
+#define WinFspVersion  "2.1.25156"
 
 [Setup]
 AppId={{E8A3F4D1-7B2C-4E5A-9F6D-1A2B3C4D5E6F}
@@ -87,8 +93,11 @@ Source: "{#PublishDir}\RamDrive.exe";      DestDir: "{app}"; Flags: ignoreversio
 ; all the inline JSONC comments).
 Source: "{#PublishDir}\appsettings.jsonc";  DestDir: "{tmp}"; Flags: deleteafterinstall; Components: main
 
-; WinFsp MSI bundled installer
-Source: "{#WinFspMsi}"; DestDir: "{tmp}"; Flags: deleteafterinstall; Components: winfsp
+; WinFsp MSI bundled installer. dontcopy: kept embedded and extracted on demand
+; (via ExtractTemporaryFile in PrepareToInstall) so WinFsp can be installed
+; BEFORE the RAM disk is unmounted — see PrepareToInstall for why the ordering
+; matters. The component gate is enforced in code (WizardIsComponentSelected).
+Source: "{#WinFspMsi}"; Flags: dontcopy
 
 [Icons]
 Name: "{group}\{#MyAppName}";         Filename: "{app}\{#MyAppExeName}"
@@ -214,11 +223,65 @@ begin
     '2. Restart the service (Start Menu > RamDrive > Restart Service)';
 end;
 
+// --- WinFsp presence + version detection ------------------------------------
+//
+// WinFsp stores its settings under HKLM\SOFTWARE\WinFsp, which on every 64-bit
+// system (x64 and ARM64) physically lives in the 32-bit registry view
+// (HKLM\SOFTWARE\WOW6432Node\WinFsp). Because this installer runs in 64-bit
+// install mode (ArchitecturesInstallIn64BitMode), a bare HKLM constant maps to
+// the 64-bit view and never finds the key — so we must read HKLM32 explicitly.
+// (This was the bug that made WinFsp reinstall on every run.)
+
+function GetWinFspInstallDir(var InstallDir: String): Boolean;
+begin
+  Result := RegQueryStringValue(HKLM32, 'SOFTWARE\WinFsp', 'InstallDir', InstallDir)
+            and (InstallDir <> '');
+end;
+
 function IsWinFspInstalled: Boolean;
 var
   InstallDir: String;
 begin
-  Result := RegQueryStringValue(HKLM, 'SOFTWARE\WinFsp', 'InstallDir', InstallDir) and (InstallDir <> '');
+  Result := GetWinFspInstallDir(InstallDir);
+end;
+
+// Reads the installed WinFsp version from the architecture-appropriate DLL in
+// its bin directory (the registry stores no version field), as a packed Int64.
+// Returns False if WinFsp is absent or the DLL can't be read.
+function GetInstalledWinFspVersion(var Version: Int64): Boolean;
+var
+  InstallDir, DllPath: String;
+begin
+  Result := False;
+  if not GetWinFspInstallDir(InstallDir) then Exit;
+  DllPath := AddBackslash(InstallDir) + 'bin\{#WinFspDll}';
+  if not FileExists(DllPath) then Exit;
+  Result := GetPackedVersion(DllPath, Version);
+end;
+
+// True when the bundled WinFsp ({#WinFspVersion}) should be installed: either
+// WinFsp is not present, or the installed version is strictly older than the
+// bundled one. An equal-or-newer install is left untouched.
+function ShouldInstallWinFsp: Boolean;
+var
+  Installed, Bundled: Int64;
+begin
+  if not IsWinFspInstalled then
+  begin
+    Result := True;
+    Exit;
+  end;
+
+  // Unknown installed version (DLL missing/unreadable) → don't risk a reinstall
+  // loop; treat as "present" and skip.
+  if not GetInstalledWinFspVersion(Installed) then
+  begin
+    Result := False;
+    Exit;
+  end;
+
+  StrToVersion('{#WinFspVersion}', Bundled);
+  Result := ComparePackedVersion(Installed, Bundled) < 0;
 end;
 
 function IsServiceInstalled: Boolean;
@@ -299,6 +362,14 @@ var
   ResultCode: Integer;
   MsiPath: String;
 begin
+  // The MSI is bundled with the dontcopy flag; extract it on demand. This is
+  // called from PrepareToInstall — BEFORE the RAM disk is unmounted — for a
+  // subtle reason: msiexec extracts WinFsp's own payload into the system
+  // %TEMP%. If the user's TEMP lives on the RAM disk we are about to replace,
+  // unmounting first would pull that directory out from under msiexec and the
+  // WinFsp install would fail. Installing while the drive is still mounted
+  // keeps %TEMP% alive.
+  ExtractTemporaryFile('{#WinFspMsi}');
   MsiPath := ExpandConstant('{tmp}\{#WinFspMsi}');
   if not Exec('msiexec.exe',
               '/i "' + MsiPath + '" /qb INSTALLLEVEL=1000',
@@ -634,18 +705,22 @@ var
 begin
   Result := True;
 
-  // Heads-up before we touch anything: if the user's TEMP is on a RAM disk
-  // (their own existing one, or any other WinFsp mount), the installer will
-  // self-destruct when sc.exe stop unmounts the drive. We can't reliably
+  // Heads-up before we touch anything: if the installer's own working folder
+  // ({tmp}) is on a RAM disk, the install can still self-destruct. WinFsp is
+  // now installed *before* the RAM disk is unmounted (see PrepareToInstall), so
+  // the WinFsp MSI itself is safe — but PrepareToInstall then stops the service
+  // and unmounts the drive while {tmp} (extracted appsettings template, etc.)
+  // is still needed by the [Files] copy step that follows. We can't reliably
   // detect "is this drive a RAM disk" from inside Inno Setup, so we ask the
   // user — and if they want to relocate, we re-launch with TEMP overridden.
   TempPath := ExpandConstant('{tmp}');
   Choice := TaskDialogMsgBox(
     'TEMP folder check',
-    'If your TEMP folder is on a RAM disk, this installer will fail mid-install. ' +
-    'Stopping the existing RamDrive service to swap binaries unmounts the RAM ' +
-    'disk — which deletes the installer''s own working files (in TEMP), leaving ' +
-    'the system in a broken state (service stopped, new binaries not in place).' + #13#10 + #13#10 +
+    'If your TEMP folder is on a RAM disk, this installer may fail mid-install. ' +
+    'To swap binaries the installer stops the existing RamDrive service, which ' +
+    'unmounts the RAM disk — and that deletes the installer''s own working files ' +
+    '(in TEMP) before they are copied into place, leaving the system in a broken ' +
+    'state (service stopped, new binaries not installed).' + #13#10 + #13#10 +
     'Current TEMP location:' + #13#10 +
     '    ' + TempPath,
     mbError,
@@ -698,17 +773,12 @@ begin
                       'Any data on the RAM disk will be lost.' + #13#10 + #13#10 +
                       'Stop RamDrive and continue installation?',
                       mbConfirmation, MB_YESNO);
-    if Choice = IDYES then
-    begin
-      if IsServiceInstalled then
-        StopAndDeleteService;
-      KillProcess('RamDrive');
-      Sleep(2000);
-    end
-    else
-    begin
+    // Only obtain consent here; the actual stop/unmount is DEFERRED to
+    // PrepareToInstall so it runs AFTER WinFsp is installed. Unmounting now
+    // would destroy a RAM-disk-backed %TEMP% that the WinFsp MSI relies on
+    // (msiexec extracts WinFsp's payload there).
+    if Choice <> IDYES then
       Result := False;
-    end;
   end;
 end;
 
@@ -761,25 +831,49 @@ begin
     CreateTempCheckbox.Checked := False;
 end;
 
+// PrepareToInstall runs after the wizard pages but BEFORE [Files] are copied.
+// This is the correct point to (1) install WinFsp while the existing RAM disk
+// is still mounted, then (2) stop and unmount that RAM disk so its RamDrive.exe
+// is unlocked before we overwrite it. Ordering rationale:
+//   - WinFsp first: msiexec extracts WinFsp's payload into the system %TEMP%,
+//     which may itself live on the RAM disk we are replacing. Unmounting before
+//     installing WinFsp would delete that %TEMP% mid-install and fail.
+//   - Unmount second, but still before [Files]: the running RamDrive.exe holds
+//     a lock on its own binary; it must be gone before the new exe is copied.
+function PrepareToInstall(var NeedsRestart: Boolean): String;
+begin
+  Result := '';
+
+  // Install WinFsp if selected and an equal-or-newer version isn't already
+  // present. Done here (drive still mounted) — see note above.
+  if WizardIsComponentSelected('winfsp') and ShouldInstallWinFsp then
+    InstallWinFsp;
+
+  // Now tear down any running RamDrive so [Files] can replace the binary.
+  // Skip entirely on a clean install (nothing to stop) to avoid a needless
+  // sc.exe round-trip and Sleep.
+  if IsServiceInstalled or IsRamDriveRunning then
+  begin
+    if IsServiceInstalled then
+      StopAndDeleteService;
+    KillProcess('RamDrive');
+    Sleep(2000);
+  end;
+end;
+
 procedure CurStepChanged(CurStep: TSetupStep);
 begin
   if CurStep = ssPostInstall then
   begin
-    // Install WinFsp if selected and not already present
-    if WizardIsComponentSelected('winfsp') and not IsWinFspInstalled then
-      InstallWinFsp;
-
     // Enable Mount Manager so non-admin mounts are visible to all apps
     ConfigureWinFspMountManager;
 
     // Write appsettings.jsonc with user-chosen drive letter and capacity
     WriteAppSettings;
 
-    // Stop existing service before re-registering
-    if IsServiceInstalled then
-      StopAndDeleteService;
-
-    // Register and start Windows Service if selected
+    // Register and start Windows Service if selected. WinFsp was installed and
+    // the old service torn down in PrepareToInstall, before the files were
+    // copied.
     if WizardIsComponentSelected('service') then
     begin
       CreateService;

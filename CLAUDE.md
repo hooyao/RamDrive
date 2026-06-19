@@ -225,10 +225,16 @@ ISCC.exe setup/RamDrive.iss
 
 **Wizard features:**
 - Drive letter dropdown (D:–Z:) and capacity spin edit (16 MB–128 GB)
-- Bundles and silently installs WinFsp MSI if not already present
+- Bundles WinFsp MSI and installs it only when an equal-or-newer version isn't already present (see **WinFsp install ordering & detection** below)
 - Sets `MountUseMountmgrFromFSD=1` registry key for non-admin Mount Manager mounts
 - Registers Windows Service via `{sysnative}\sc.exe` (bypasses WOW64 redirect in 32-bit installer)
 - Start Menu shortcuts: app, Edit Configuration (notepad → appsettings.jsonc), Restart Service
+
+**WinFsp install ordering & detection** — two non-obvious constraints, easy to regress:
+
+- **Detection reads the 32-bit registry view.** WinFsp stores `HKLM\SOFTWARE\WinFsp\InstallDir` in the WOW6432Node (32-bit) view on all 64-bit systems. The installer runs in 64-bit install mode (`ArchitecturesInstallIn64BitMode`), so a bare `HKLM` read maps to the 64-bit view, never finds the key, and reinstalls WinFsp on every run. Use `HKLM32` explicitly (`GetWinFspInstallDir`). This regressed in PR #18 (ARM64), which added `ArchitecturesInstallIn64BitMode`; before that the 32-bit installer's WOW64 redirect masked the bug. Writes already use the explicit `SOFTWARE\WOW6432Node\WinFsp` path.
+- **Version gating.** `ShouldInstallWinFsp` compares `GetPackedVersion` of `bin\winfsp-<arch>.dll` against the `WinFspVersion` macro via `ComparePackedVersion`; installs only when strictly older. Keep `WinFspMsi` / `WinFspVersion` macros and `release.yml`'s download URL in sync.
+- **Install WinFsp BEFORE unmounting the RAM disk.** msiexec extracts WinFsp's own payload into the system `%TEMP%`, which may itself live on the RAM disk being replaced. `PrepareToInstall` (runs before `[Files]` copy) does: install WinFsp (drive still mounted) → stop service + `KillProcess` + unmount (must precede `[Files]` so the locked `RamDrive.exe` is gone). Never move the WinFsp install after the unmount. The MSI uses the `dontcopy` flag + `ExtractTemporaryFile` so it isn't pre-copied to a (possibly RAM-disk) `{tmp}`. `InitializeSetup` only collects consent to stop a running RamDrive; the actual teardown is deferred to `PrepareToInstall`.
 
 **Service registration details:**
 - `StopAndDeleteService` polls `sc.exe query` until SCM fully removes the old service before creating a new one — avoids the Windows race where a pending-delete service shadows the new creation.
