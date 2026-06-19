@@ -1,4 +1,4 @@
-; RamDrive Inno Setup Script
+﻿; RamDrive Inno Setup Script
 ; Bundles RamDrive AOT exe + WinFsp installer
 ; Supports both portable (green) and Windows Service modes
 ;
