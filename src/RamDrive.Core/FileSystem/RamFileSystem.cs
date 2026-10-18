@@ -44,7 +44,7 @@ public sealed class RamFileSystem : IDisposable
     {
         lock (_structureLock)
         {
-            return FindNodeInternal(path);
+            return FindNodeInternal(StreamPath.Normalize(path));
         }
     }
 
@@ -79,6 +79,76 @@ public sealed class RamFileSystem : IDisposable
     }
 
     /// <summary>
+    /// Enumerate the named streams (Alternate Data Streams) attached to the object at
+    /// <paramref name="basePath"/>. A stream path is accepted and normalized to its base.
+    /// Returns stream-name/node pairs sorted by stream name. Streams of files, directories
+    /// and the volume root are all supported (NTFS semantics).
+    /// </summary>
+    public IReadOnlyList<(string StreamName, FileNode Node)> GetNamedStreams(string basePath)
+    {
+        basePath = StreamPath.GetBasePath(StreamPath.Normalize(basePath));
+        lock (_structureLock)
+        {
+            FileNode parent;
+            string baseName;
+            if (string.IsNullOrEmpty(basePath) || basePath == "\\")
+            {
+                parent = _root;
+                baseName = string.Empty;
+            }
+            else
+            {
+                var (p, n) = ResolvePath(basePath);
+                if (p == null || n == null) return Array.Empty<(string, FileNode)>();
+                parent = p;
+                baseName = n;
+            }
+
+            string prefix = baseName + ":";
+            var result = new List<(string, FileNode)>();
+            foreach (var kv in parent.Children!)
+            {
+                if (kv.Key.IndexOf(':') < 0) continue;
+                if (!kv.Key.StartsWith(prefix, StringComparison.OrdinalIgnoreCase)) continue;
+                result.Add((kv.Key[prefix.Length..], kv.Value));
+            }
+            result.Sort(static (a, b) => string.Compare(a.Item1, b.Item1, StringComparison.OrdinalIgnoreCase));
+            return result;
+        }
+    }
+
+    /// <summary>
+    /// Collect the STREAM children of <paramref name="parent"/> whose name is
+    /// <c>baseName + ":" + ...</c> (i.e. the named streams of the sibling named
+    /// <paramref name="baseName"/>). Caller must hold <see cref="_structureLock"/>.
+    /// </summary>
+    private static List<KeyValuePair<string, FileNode>> CollectStreams(FileNode parent, string baseName)
+    {
+        string prefix = baseName + ":";
+        var result = new List<KeyValuePair<string, FileNode>>();
+        foreach (var kv in parent.Children!)
+        {
+            if (kv.Key.IndexOf(':') < 0) continue;
+            if (!kv.Key.StartsWith(prefix, StringComparison.OrdinalIgnoreCase)) continue;
+            result.Add(kv);
+        }
+        return result;
+    }
+
+    /// <summary>
+    /// Count the REAL (non-stream) children of <paramref name="dir"/>. Named streams are
+    /// attached data, not directory entries, so they never make a directory "non-empty".
+    /// </summary>
+    private static int RealChildCount(FileNode dir)
+    {
+        if (dir.Children == null) return 0;
+        int count = 0;
+        foreach (var name in dir.Children.Keys)
+            if (name.IndexOf(':') < 0) count++;
+        return count;
+    }
+
+    /// <summary>
     /// Create a file at the given path. Parent directory must exist.
     /// Returns the new FileNode, or null if parent not found or name already exists.
     /// </summary>
@@ -88,12 +158,23 @@ public sealed class RamFileSystem : IDisposable
     /// <summary>Create with an optional open reference that must be released with CloseNode.</summary>
     public FileNode? CreateFile(string path, byte[]? securityDescriptor, bool acquireReference)
     {
+        path = StreamPath.Normalize(path);
         lock (_structureLock)
         {
             ObjectDisposedException.ThrowIf(_disposed, this);
             var (parent, name) = ResolvePath(path);
             if (parent == null || !parent.IsDirectory || name == null) return null;
             if (parent.Children!.ContainsKey(name)) return null;
+
+            // Named stream: the base object (file or directory — including the root) must
+            // already exist. Streams are always data streams (never directories), and they
+            // live as siblings of the base object in the tree, keyed by "base:stream".
+            int colon = name.IndexOf(':');
+            if (colon >= 0)
+            {
+                string baseName = name[..colon];
+                if (baseName.Length != 0 && !parent.Children!.ContainsKey(baseName)) return null;
+            }
 
             var node = FileNode.CreateFile(name, _pool);
             if (acquireReference) node.OpenReferences = 1;
@@ -118,11 +199,14 @@ public sealed class RamFileSystem : IDisposable
     /// <summary>Create with an optional open reference that must be released with CloseNode.</summary>
     public FileNode? CreateDirectory(string path, byte[]? securityDescriptor, bool acquireReference)
     {
+        path = StreamPath.Normalize(path);
         lock (_structureLock)
         {
             ObjectDisposedException.ThrowIf(_disposed, this);
             var (parent, name) = ResolvePath(path);
             if (parent == null || !parent.IsDirectory || name == null) return null;
+            // A named stream is a data stream and can never be a directory.
+            if (name.IndexOf(':') >= 0) return null;
             if (parent.Children!.ContainsKey(name)) return null;
 
             var node = FileNode.CreateDirectory(name);
@@ -138,9 +222,14 @@ public sealed class RamFileSystem : IDisposable
 
     /// <summary>
     /// Delete a file or empty directory. Returns true if deleted.
+    ///
+    /// <para>Deleting a base object (no named stream in the path) also deletes ALL of its
+    /// named streams (NTFS semantics). Deleting a single named stream removes only that
+    /// stream and leaves the base object intact.</para>
     /// </summary>
     public bool Delete(string path)
     {
+        path = StreamPath.Normalize(path);
         lock (_structureLock)
         {
             var node = FindNodeInternal(path);
@@ -157,52 +246,101 @@ public sealed class RamFileSystem : IDisposable
 
     private bool UnlinkNode(FileNode node)
     {
-        if (node == _root || !node.IsLinked ||
-            (node.IsDirectory && node.Children!.Count > 0)) return false;
+        // Named streams are attached data, not directory entries: a directory whose only
+        // "children" are streams (keys containing ':') is still empty and deletable.
+        if (node == _root || !node.IsLinked) return false;
+        if (node.IsDirectory)
+        {
+            foreach (var child in node.Children!)
+                if (child.Key.IndexOf(':') < 0) return false;
+        }
         var parent = node.Parent;
         if (parent?.Children == null ||
             !parent.Children.TryGetValue(node.Name, out var current) ||
             !ReferenceEquals(current, node)) return false;
 
-        parent.Children.Remove(node.Name);
+        string name = node.Name;
+        parent.Children.Remove(name);
         parent.LastWriteTime = DateTime.UtcNow;
-        node.Parent = null;
-        node.IsLinked = false;
-        if (node.OpenReferences == 0) node.Dispose();
-        else _unlinkedNodes.Add(node);
+        RetireNode(node);
+
+        // Deleting a base object cascades to its named streams (NTFS semantics); deleting
+        // a single stream leaves its base intact.
+        if (!StreamPath.HasStream(name))
+        {
+            foreach (var (sname, snode) in CollectStreams(parent, name))
+            {
+                parent.Children.Remove(sname);
+                RetireNode(snode);
+            }
+        }
         return true;
     }
 
     /// <summary>
+    /// Mark <paramref name="node"/> as unlinked and dispose it now, or retain its backing
+    /// content until the final open context closes. Caller must hold <see cref="_structureLock"/>.
+    /// </summary>
+    private void RetireNode(FileNode node)
+    {
+        node.Parent = null;
+        node.IsLinked = false;
+        if (node.OpenReferences == 0) node.Dispose();
+        else _unlinkedNodes.Add(node);
+    }
+
+    /// <summary>
     /// Move/rename a file or directory.
+    ///
+    /// <para>Only base objects may be moved. Moving a base object renames all of its named
+    /// streams along with it (<c>old:s</c> → <c>new:s</c>); a single named stream cannot be
+    /// relocated on its own (NTFS semantics).</para>
     /// </summary>
     public bool Move(string oldPath, string newPath, bool replace)
     {
+        oldPath = StreamPath.Normalize(oldPath);
+        newPath = StreamPath.Normalize(newPath);
         lock (_structureLock)
         {
             ObjectDisposedException.ThrowIf(_disposed, this);
             var sourceNode = FindNodeInternal(oldPath);
             if (sourceNode == null || sourceNode == _root) return false;
 
+            // Moving an individual named stream is not supported.
+            if (StreamPath.HasStream(sourceNode.Name)) return false;
+
             var (newParent, newName) = ResolvePath(newPath);
             if (newParent == null || !newParent.IsDirectory || newName == null) return false;
+            // Destination must be a base object too.
+            if (StreamPath.HasStream(newName)) return false;
 
             if (newParent.Children!.TryGetValue(newName, out var existing))
             {
-                if (!ReferenceEquals(existing, sourceNode))
-                {
-                    if (!replace || !UnlinkNode(existing)) return false;
-                }
+                if (!replace || !UnlinkNode(existing)) return false;
             }
 
+            string oldName = sourceNode.Name;
             var oldParent = sourceNode.Parent;
-            oldParent?.Children?.Remove(sourceNode.Name);
+            oldParent?.Children?.Remove(oldName);
             if (oldParent != null) oldParent.LastWriteTime = DateTime.UtcNow;
 
             sourceNode.Name = newName;
             sourceNode.Parent = newParent;
             newParent.Children[newName] = sourceNode;
             newParent.LastWriteTime = DateTime.UtcNow;
+
+            // Carry the named streams over to the new base name.
+            if (oldParent != null)
+            {
+                foreach (var (sname, snode) in CollectStreams(oldParent, oldName))
+                {
+                    oldParent.Children!.Remove(sname);
+                    string suffix = sname[oldName.Length..]; // ":stream"
+                    snode.Name = newName + suffix;
+                    snode.Parent = newParent;
+                    newParent.Children[snode.Name] = snode;
+                }
+            }
 
             return true;
         }
@@ -213,13 +351,16 @@ public sealed class RamFileSystem : IDisposable
     /// </summary>
     public IReadOnlyList<FileNode>? ListDirectory(string path)
     {
+        path = StreamPath.Normalize(path);
         lock (_structureLock)
         {
             var node = FindNodeInternal(path);
             if (node == null || !node.IsDirectory) return null;
             // Must be sorted by name (case-insensitive) for WinFsp marker-based
             // directory enumeration pagination to work correctly.
+            // Named streams (ADS) are attached data, never directory entries.
             return node.Children!.Values
+                .Where(n => n.Name.IndexOf(':') < 0)
                 .OrderBy(n => n.Name, StringComparer.OrdinalIgnoreCase)
                 .ToList();
         }

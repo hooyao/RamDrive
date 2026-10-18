@@ -106,6 +106,7 @@ public sealed unsafe class WinFspRamAdapter : IFileSystem
         host.UnicodeOnDisk = true;
         host.PersistentAcls = true;
         host.PostCleanupWhenModifiedOnly = true;
+        host.NamedStreams = true;
         // Non-zero volume serial. std::filesystem::copy_file compares (VolumeSerialNumber, file id)
         // to detect "source and destination are the same file". A zero serial combined with a zero
         // file id makes EVERY pair of files look identical, so a same-volume copy_file throws
@@ -530,10 +531,18 @@ public sealed unsafe class WinFspRamAdapter : IFileSystem
         if (node == null)
             return V(NtStatus.ObjectNameNotFound);
 
-        if (node.IsDirectory && node.Children!.Count > 0)
+        if (node.IsDirectory)
         {
-            FsTracer.Trace("CanDelete-NotEmpty", fileName, $"children={node.Children!.Count}");
-            return V(NtStatus.DirectoryNotEmpty);
+            // Named streams are attached data, not directory entries — they do not make a
+            // directory non-empty.
+            foreach (var child in node.Children!)
+            {
+                if (child.Key.IndexOf(':') < 0)
+                {
+                    FsTracer.Trace("CanDelete-NotEmpty", fileName, $"children={node.Children!.Count}");
+                    return V(NtStatus.DirectoryNotEmpty);
+                }
+            }
         }
 
         FsTracer.Trace("CanDelete", fileName);
@@ -544,6 +553,14 @@ public sealed unsafe class WinFspRamAdapter : IFileSystem
         string fileName, string newFileName, bool replaceIfExists,
         FileOperationInfo info, CancellationToken ct)
     {
+        // Only base objects may be moved. Moving an individual named stream (or moving a
+        // base object onto a stream name) is not supported — streams follow their base.
+        if (StreamPath.HasStream(fileName) || StreamPath.HasStream(newFileName))
+        {
+            FsTracer.Trace("MoveFile-StreamRejected", fileName, $"to={newFileName}");
+            return V(NtStatus.AccessDenied);
+        }
+
         if (_fs.Move(fileName, newFileName, replaceIfExists))
         {
             // Update cached node — name changed
@@ -560,6 +577,68 @@ public sealed unsafe class WinFspRamAdapter : IFileSystem
         }
         FsTracer.Trace("MoveFile-Coll", fileName, $"=> {newFileName}");
         return V(NtStatus.ObjectNameCollision);
+    }
+
+    // ═══════════════════════════════════════════
+    //  Named streams (ADS)
+    // ═══════════════════════════════════════════
+
+    /// <summary>
+    /// Enumerate the streams of the object addressed by <paramref name="fileName"/>.
+    ///
+    /// <para>WinFsp routes <c>FindFirstStreamW</c> / <c>FindNextStreamW</c> — and the
+    /// stream-preservation logic inside <c>ReplaceFileW</c> — here. Once
+    /// <c>host.NamedStreams</c> is enabled this callback MUST succeed, otherwise those
+    /// APIs fail with <c>STATUS_INVALID_DEVICE_REQUEST</c>.</para>
+    ///
+    /// <para>Layout matches WinFsp memfs: for non-directories the main (unnamed) stream is
+    /// reported first with an empty name, then every named stream, terminated by
+    /// <see cref="WinFspFileSystem.EndStreamInfo"/>. Directories report only their named
+    /// streams (NTFS allows streams on directories and on the volume root). If the response
+    /// buffer fills up, what fit is reported and no terminator is emitted.</para>
+    /// </summary>
+    public int GetStreamInfo(string fileName, nint buffer, uint length, out uint bytesTransferred, FileOperationInfo info)
+    {
+        string basePath = StreamPath.GetBasePath(StreamPath.Normalize(fileName));
+        var main = _fs.FindNode(basePath);
+        if (main == null)
+        {
+            bytesTransferred = 0;
+            FsTracer.Trace("GetStreamInfo-NF", fileName);
+            return NtStatus.ObjectNameNotFound;
+        }
+
+        uint written = 0;
+        if (!main.IsDirectory && !AddStreamInfo(buffer, length, &written, string.Empty, main))
+        {
+            bytesTransferred = written;
+            return NtStatus.Success;
+        }
+
+        foreach (var (streamName, node) in _fs.GetNamedStreams(basePath))
+        {
+            if (!AddStreamInfo(buffer, length, &written, streamName, node))
+            {
+                bytesTransferred = written;
+                return NtStatus.Success;
+            }
+        }
+
+        WinFspFileSystem.EndStreamInfo(buffer, length, &written);
+        bytesTransferred = written;
+        FsTracer.Trace("GetStreamInfo", fileName, $"bytes={written}");
+        return NtStatus.Success;
+    }
+
+    /// <summary>Append one FSP_FSCTL_STREAM_INFO record. Returns false when the buffer is full.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static bool AddStreamInfo(nint buffer, uint length, uint* pBytesTransferred, string streamName, FileNode node)
+    {
+        var streamInfo = new FspStreamInfo();
+        streamInfo.SetStreamName(streamName);
+        streamInfo.StreamSize = (ulong)node.Size;
+        streamInfo.StreamAllocationSize = (ulong)node.AllocatedBytes;
+        return WinFspFileSystem.AddStreamInfo(&streamInfo, buffer, length, pBytesTransferred);
     }
 
     // ═══════════════════════════════════════════
@@ -646,6 +725,10 @@ public sealed unsafe class WinFspRamAdapter : IFileSystem
         // pattern is applied by WinFsp internally (PassQueryDirectoryPattern is not set); no filtering here.
         foreach (var child in children)
         {
+            // Do not expose named streams (ADS) in directory enumeration.
+            if (child.Name.IndexOf(':') >= 0)
+                continue;
+
             // marker: skip entries <= marker (sorted by name, case-insensitive)
             if (marker != null && string.Compare(child.Name, marker, StringComparison.OrdinalIgnoreCase) <= 0)
                 continue;
