@@ -6,11 +6,10 @@
 // on rename, and it is deleted together with it. Streams may be attached to files,
 // directories and the volume root (NTFS semantics).
 //
-// See docs/ads-support-plan.md for the design and WinFspRamAdapter / RamFileSystem
-// for the implementation.
+// See WinFspRamAdapter / RamFileSystem for the implementation.
 //
-// NOTE: these tests mount a real WinFsp volume and must be executed on the isolated
-// test VM — never on the development workstation. See docs/testing-on-vm.md.
+// NOTE: these tests mount a real WinFsp volume and therefore require WinFsp to be
+// installed on the machine running them.
 
 using System.ComponentModel;
 using System.Runtime.InteropServices;
@@ -111,11 +110,18 @@ public sealed class AlternateDataStreamsTests : IDisposable
     }
 
     [Fact]
-    public void Creating_a_stream_on_a_missing_base_fails()
+    public void Creating_a_stream_on_a_missing_base_creates_the_base_file()
     {
-        string orphan = Path.Combine(_dir, "does-not-exist.txt") + ":s";
-        Action act = () => File.WriteAllText(orphan, "x");
-        act.Should().Throw<IOException>();
+        // NTFS semantics: addressing a stream of an object that does not exist yet creates
+        // that object implicitly (a zero-length main stream plus the named stream).
+        string baseFile = Path.Combine(_dir, "created-by-stream.txt");
+
+        File.WriteAllText(baseFile + ":s", "x");
+
+        File.Exists(baseFile).Should().BeTrue();
+        File.Exists(baseFile + ":s").Should().BeTrue();
+        File.ReadAllText(baseFile).Should().BeEmpty("only the named stream carries data");
+        File.ReadAllText(baseFile + ":s").Should().Be("x");
     }
 
     // ─── Enumeration ─────────────────────────────────────────────────────────
@@ -236,7 +242,9 @@ public sealed class AlternateDataStreamsTests : IDisposable
 
         File.ReadAllText(dir + ":meta").Should().Be("DIR-META");
         Directory.Exists(dir).Should().BeTrue();
-        Directory.GetFiles(_dir).Select(Path.GetFileName).Should().BeEquivalentTo(new[] { "sub" });
+        // The stream must not surface as an entry of its base either.
+        Directory.GetFileSystemEntries(dir).Should().BeEmpty();
+        Directory.GetFileSystemEntries(_dir).Select(Path.GetFileName).Should().BeEquivalentTo(new[] { "sub" });
     }
 
     [Fact]
@@ -282,15 +290,20 @@ public sealed class AlternateDataStreamsTests : IDisposable
     }
 
     [Fact]
-    public void An_extra_colon_in_the_stream_name_is_kept()
+    public void A_second_colon_in_the_leaf_is_rejected_by_the_platform()
     {
+        // Win32 path parsing rejects a second ':' in the leaf (ERROR_INVALID_NAME), so a
+        // stream whose name itself contains ':' cannot be addressed from user mode — and
+        // neither can the quoted form. StreamPath splitting on the FIRST ':' therefore
+        // matches exactly what the platform is able to hand us.
         string file = Path.Combine(_dir, "a.txt");
         File.WriteAllText(file, "MAIN");
 
-        // Parsing splits on the FIRST colon in the leaf, so "a:b" is the stream name.
-        File.WriteAllText(file + ":a:b", "nested");
+        Action act = () => File.WriteAllText(file + ":a:b", "nested");
 
-        File.ReadAllText(file + ":a:b").Should().Be("nested");
-        EnumStreams(file).Should().Contain(s => s.Name == ":a:b:$DATA");
+        act.Should().Throw<IOException>();
+        File.Exists(file + ":a:b").Should().BeFalse();
+        File.Exists(file + ":\"a:b\"").Should().BeFalse();
+        File.ReadAllText(file).Should().Be("MAIN");
     }
 }
