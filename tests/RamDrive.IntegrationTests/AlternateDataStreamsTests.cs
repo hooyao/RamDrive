@@ -277,6 +277,37 @@ public sealed class AlternateDataStreamsTests : IDisposable
         }
     }
 
+    [Fact]
+    public void A_bare_stream_inside_a_subdirectory_is_rejected()
+    {
+        // NTFS allows a bare stream ("\:ads", empty base name) only directly on the
+        // volume root. Inside any subdirectory the very same syntax is refused with
+        // ERROR_INVALID_NAME — verified against a real NTFS volume. RamDrive must match
+        // that, otherwise an editor happily "saves" a stream NTFS would never create.
+        string sub = Path.Combine(_dir, "sub");
+        Directory.CreateDirectory(sub);
+
+        Action act = () => File.WriteAllText(sub + "\\:bare", "x");
+
+        act.Should().Throw<IOException>();
+        File.Exists(sub + "\\:bare").Should().BeFalse();
+        File.Exists(sub + "\\:bare:$DATA").Should().BeFalse();
+    }
+
+    [Fact]
+    public void A_stream_on_a_named_subdirectory_is_allowed()
+    {
+        // The forbidden shape is "dir\:ads" (empty base); "dir:ads" (the directory's
+        // own name in front of the colon) is a legitimate stream on that directory and
+        // works anywhere, including inside a subdirectory.
+        string dir = Path.Combine(_dir, "sub");
+        Directory.CreateDirectory(dir);
+
+        File.WriteAllText(dir + ":meta", "DIR-META");
+
+        File.ReadAllText(dir + ":meta").Should().Be("DIR-META");
+    }
+
     // ─── Names ───────────────────────────────────────────────────────────────
 
     [Fact]
