@@ -169,11 +169,24 @@ public sealed class RamFileSystem : IDisposable
             // Named stream: the base object (file or directory — including the root) must
             // already exist. Streams are always data streams (never directories), and they
             // live as siblings of the base object in the tree, keyed by "base:stream".
+            //
+            // An EMPTY base name (path shape "\:stream") is only valid when the parent is
+            // the volume root: NTFS allows a stream directly on the root ("C:\:ads") but
+            // REJECTS the same syntax inside any subdirectory ("C:\dir\:ads" →
+            // ERROR_INVALID_NAME). Streams on named objects ("dir:ads", "file.txt:ads")
+            // remain valid anywhere.
             int colon = name.IndexOf(':');
             if (colon >= 0)
             {
                 string baseName = name[..colon];
-                if (baseName.Length != 0 && !parent.Children!.ContainsKey(baseName)) return null;
+                if (baseName.Length == 0)
+                {
+                    if (parent != _root) return null;
+                }
+                else if (!parent.Children!.ContainsKey(baseName))
+                {
+                    return null;
+                }
             }
 
             var node = FileNode.CreateFile(name, _pool);
