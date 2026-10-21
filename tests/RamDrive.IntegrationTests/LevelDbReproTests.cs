@@ -67,7 +67,7 @@ internal static partial class LevelDbWin32
 [Collection("RamDrive")]
 public class LevelDbReproTests(RamDriveFixture fx, ITestOutputHelper output) : IDisposable
 {
-    private readonly string _dir = Path.Combine(fx.Root, $"ldb_{Guid.NewGuid():N}");
+    private readonly string _dir = Path.Combine(fx.ResetForTest().Root, $"ldb_{Guid.NewGuid():N}");
 
     public void Dispose()
     {

@@ -9,7 +9,7 @@ public class InitialDirectoryTests : IDisposable
 
     public InitialDirectoryTests(RamDriveFixture fx)
     {
-        _root = Path.Combine(fx.Root, $"initdir_{Guid.NewGuid():N}");
+        _root = Path.Combine(fx.ResetForTest().Root, $"initdir_{Guid.NewGuid():N}");
         Directory.CreateDirectory(_root);
     }
 

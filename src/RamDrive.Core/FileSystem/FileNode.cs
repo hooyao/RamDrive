@@ -31,6 +31,12 @@ public sealed class FileNode : IDisposable
 
     public FileNode? Parent { get; set; }
 
+    // Owned by RamFileSystem's structure lock. A namespace entry and each
+    // WinFsp open context independently keep the backing object alive.
+    internal bool IsLinked { get; set; } = true;
+    internal int OpenReferences { get; set; }
+    private int _disposed;
+
     /// <summary>
     /// Unique, stable per-node file id (NTFS-style file index / inode number). Surfaced to WinFsp
     /// as <c>FspFileInfo.IndexNumber</c>. MUST be unique across all live nodes: the CRT/STL
@@ -82,6 +88,7 @@ public sealed class FileNode : IDisposable
 
     public void Dispose()
     {
+        if (Interlocked.Exchange(ref _disposed, 1) != 0) return;
         Content?.Dispose();
         if (Children != null)
         {

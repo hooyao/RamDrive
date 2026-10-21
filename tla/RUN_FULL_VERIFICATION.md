@@ -47,6 +47,19 @@ is documented in **`CLAUDE.md`** (search for "Formal Verification (`tla/`)").
 
 ---
 
+## File-object lifetime regression (issue #24)
+
+Run `./tla/Verify-Lifetime.ps1` from the repository root for the bounded lifetime
+models, including the required negative counterexample. See
+[`FILE_OBJECT_LIFETIME.md`](FILE_OBJECT_LIFETIME.md) for ownership mappings, exact
+bounds, fairness assumptions and larger combined configurations.
+
+`RamDiskSystem` now distinguishes namespace linkage, retained open references and
+backing-object lifetime. Existing configurations use `MaxOpenReferences=0` for
+the memory-protocol baseline; the lifecycle configurations enable open references.
+The historical runtime estimates below can be substantially exceeded by the
+current model. Report only fully completed runs as passes.
+
 ## What to run, in order
 
 Start with the cheapest config to confirm the runner works, then move up.

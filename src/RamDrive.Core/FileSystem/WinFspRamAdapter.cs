@@ -228,7 +228,7 @@ public sealed unsafe class WinFspRamAdapter : IFileSystem
 
         if (isDir)
         {
-            var dir = _fs.CreateDirectory(fileName, securityDescriptor);
+            var dir = _fs.CreateDirectory(fileName, securityDescriptor, acquireReference: true);
             if (dir == null)
             {
                 FsTracer.Trace("CreateFile-Dir-Coll", fileName);
@@ -244,7 +244,7 @@ public sealed unsafe class WinFspRamAdapter : IFileSystem
             return V(new CreateResult(NtStatus.Success, MakeFileInfo(dir)));
         }
 
-        var file = _fs.CreateFile(fileName, securityDescriptor);
+        var file = _fs.CreateFile(fileName, securityDescriptor, acquireReference: true);
         if (file == null)
         {
             // Distinguish: parent not found vs name collision
@@ -277,7 +277,7 @@ public sealed unsafe class WinFspRamAdapter : IFileSystem
         string fileName, uint createOptions, uint grantedAccess,
         FileOperationInfo info, CancellationToken ct)
     {
-        var node = _fs.FindNode(fileName);
+        var node = _fs.OpenNode(fileName);
         if (node == null)
         {
             FsTracer.Trace("OpenFile-NF", fileName, $"co=0x{createOptions:X} ga=0x{grantedAccess:X}");
@@ -568,21 +568,21 @@ public sealed unsafe class WinFspRamAdapter : IFileSystem
 
     public void Cleanup(string? fileName, FileOperationInfo info, CleanupFlags flags)
     {
-        if (flags.HasFlag(CleanupFlags.Delete) && fileName != null)
+        var node = Node(info);
+        if (flags.HasFlag(CleanupFlags.Delete) && node != null)
         {
-            // Capture IsDirectory BEFORE Delete disposes the node.
-            bool wasDir = info.IsDirectory;
-            _fs.Delete(fileName);
+            bool wasDir = node.IsDirectory;
+            bool removed = _fs.Delete(node);
             FsTracer.Trace("Cleanup-Delete", fileName, $"isDir={wasDir} flags=0x{(uint)flags:X}");
-            Notify(wasDir ? FileNotify.ChangeDirName : FileNotify.ChangeFileName,
-                FileNotify.ActionRemoved, fileName);
+            if (removed && fileName != null)
+                Notify(wasDir ? FileNotify.ChangeDirName : FileNotify.ChangeFileName,
+                    FileNotify.ActionRemoved, fileName);
         }
         else if (fileName != null)
         {
             FsTracer.Trace("Cleanup", fileName, $"flags=0x{(uint)flags:X}");
         }
 
-        var node = Node(info);
         if (node == null) return;
 
         if (flags.HasFlag(CleanupFlags.SetLastWriteTime))
@@ -596,7 +596,15 @@ public sealed unsafe class WinFspRamAdapter : IFileSystem
     public void Close(FileOperationInfo info)
     {
         if (info.FileName is { } path) FsTracer.Trace("Close", path);
+        var node = Node(info);
         info.Context = null;
+        if (node != null) _fs.CloseNode(node);
+    }
+
+    public int ExceptionHandler(Exception ex)
+    {
+        _logger.LogError(ex, "Unexpected file system callback exception");
+        return NtStatus.UnexpectedIoError;
     }
 
     // ═══════════════════════════════════════════

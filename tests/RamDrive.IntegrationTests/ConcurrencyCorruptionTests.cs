@@ -17,6 +17,7 @@ namespace RamDrive.IntegrationTests;
 [Collection("RamDrive")]
 public class ConcurrencyCorruptionTests(RamDriveFixture fx)
 {
+    private readonly RamDriveFixture _testFixture = fx.ResetForTest();
     [Fact]
     public async Task EachFileOnlyHoldsItsOwnValue_NoCrossContamination()
     {
@@ -25,7 +26,7 @@ public class ConcurrencyCorruptionTests(RamDriveFixture fx)
         const int NFILES = 16;
         const int MAXSZ = 300_000;   // small: 16 * 300KB << 512MB pool, so no legitimate DISK_FULL
 
-        var root = Path.Combine(fx.Root, $"corrupt_{Guid.NewGuid():N}");
+        var root = Path.Combine(_testFixture.Root, $"corrupt_{Guid.NewGuid():N}");
         Directory.CreateDirectory(root);
         string P(int i) => Path.Combine(root, $"f{i}.dat");
         byte V(int i) => (byte)(i + 1);          // 1..16, all non-zero and distinct

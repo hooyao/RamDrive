@@ -46,7 +46,7 @@ internal static partial class OwnerWin32
 [SupportedOSPlatform("windows")]
 public class OwnerChangeRejectionTests(RamDriveFixture fx) : IDisposable
 {
-    private readonly string _dir = Path.Combine(fx.Root, $"own_{Guid.NewGuid():N}");
+    private readonly string _dir = Path.Combine(fx.ResetForTest().Root, $"own_{Guid.NewGuid():N}");
 
     public void Dispose() { try { Directory.Delete(_dir, true); } catch { } }
 
