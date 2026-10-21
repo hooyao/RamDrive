@@ -230,6 +230,56 @@ public sealed class AlternateDataStreamsTests : IDisposable
         File.Exists(dst + ":meta").Should().BeFalse("the destination's streams are replaced with the source object");
     }
 
+    [Fact]
+    public void Case_only_rename_preserves_content_and_streams()
+    {
+        // Regression: Children is case-insensitive, so a case-only rename resolves the
+        // destination to the source node itself. It must NOT be treated as a
+        // replacement (which disposed the source and its streams, corrupting the tree).
+        string file = Path.Combine(_dir, "a.txt");
+        string renamed = Path.Combine(_dir, "A.txt");
+        File.WriteAllText(file, "MAIN");
+        File.WriteAllText(file + ":s1", "STREAM1");
+        File.WriteAllText(file + ":s2", "STREAM2");
+
+        File.Move(file, renamed, overwrite: true);
+
+        File.ReadAllText(renamed).Should().Be("MAIN");
+        File.ReadAllText(renamed + ":s1").Should().Be("STREAM1");
+        File.ReadAllText(renamed + ":s2").Should().Be("STREAM2");
+        // Lookups stay case-insensitive (NTFS): the old spelling still resolves to the
+        // renamed object, and so do its streams. Only the canonical spelling is
+        // enumerated (checked below); the old one is not a second entry.
+        File.ReadAllText(file).Should().Be("MAIN");
+        File.Exists(file + ":s1").Should().BeTrue("the old stream spelling still resolves");
+        File.Exists(file + ":s2").Should().BeTrue("the old stream spelling still resolves");
+        File.ReadAllText(file + ":s1").Should().Be("STREAM1");
+        File.ReadAllText(file + ":s2").Should().Be("STREAM2");
+        Directory.GetFileSystemEntries(_dir).Select(Path.GetFileName).Should().BeEquivalentTo(new[] { "A.txt" });
+        // The stream-enumeration path (WinFsp FindFirstStreamW) must also see both
+        // streams under the new spelling.
+        EnumStreams(renamed).Select(s => s.Name)
+            .Should().BeEquivalentTo(new[] { "::$DATA", ":s1:$DATA", ":s2:$DATA" });
+    }
+
+    [Fact]
+    public void Case_only_rename_without_overwrite_succeeds()
+    {
+        // A case-only rename is not a name collision: replacing "a.txt" with "A.txt"
+        // keeps the very same object. NTFS allows this without an overwrite request,
+        // and so must RamDrive.
+        string file = Path.Combine(_dir, "a.txt");
+        string renamed = Path.Combine(_dir, "A.txt");
+        File.WriteAllText(file, "MAIN");
+        File.WriteAllText(file + ":s1", "STREAM1");
+
+        File.Move(file, renamed);
+
+        File.ReadAllText(renamed).Should().Be("MAIN");
+        File.ReadAllText(renamed + ":s1").Should().Be("STREAM1");
+        Directory.GetFileSystemEntries(_dir).Select(Path.GetFileName).Should().BeEquivalentTo(new[] { "A.txt" });
+    }
+
     // ─── Streams on directories and the volume root ──────────────────────────
 
     [Fact]
