@@ -327,7 +327,14 @@ public sealed class RamFileSystem : IDisposable
             // Destination must be a base object too.
             if (StreamPath.HasStream(newName)) return false;
 
-            if (newParent.Children!.TryGetValue(newName, out var existing))
+            // A destination that resolves to the source node itself is not a replacement:
+            // Children is case-insensitive, so a case-only rename ("a.txt" -> "A.txt")
+            // finds the node being moved. Treating it as a replacement would remove and
+            // Dispose the source (and then its streams), corrupting the tree. The memfs
+            // reference guards with ReferenceEquals for the same reason; a case-only
+            // rename must succeed regardless of the replace flag, as on NTFS.
+            if (newParent.Children!.TryGetValue(newName, out var existing)
+                && !ReferenceEquals(existing, sourceNode))
             {
                 if (!replace || !UnlinkNode(existing)) return false;
             }
