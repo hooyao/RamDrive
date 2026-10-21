@@ -89,32 +89,74 @@ public sealed class RamFileSystem : IDisposable
         basePath = StreamPath.GetBasePath(StreamPath.Normalize(basePath));
         lock (_structureLock)
         {
-            FileNode parent;
-            string baseName;
             if (string.IsNullOrEmpty(basePath) || basePath == "\\")
+                return StreamsOf(_root, string.Empty);
+
+            var (parent, baseName) = ResolvePath(basePath);
+            if (parent == null || baseName == null) return Array.Empty<(string, FileNode)>();
+            return StreamsOf(parent, baseName);
+        }
+    }
+
+    /// <summary>
+    /// Named streams of the object addressed by the node itself, keyed off its CURRENT
+    /// parent and name (taken under the structure lock). Use this when a caller holds a
+    /// node/handle rather than a pathname: the pathname may be stale after another handle
+    /// renamed the object or its parent, whereas <see cref="FileNode.Name"/> and
+    /// <see cref="FileNode.Parent"/> are kept current by <see cref="Move"/>.
+    ///
+    /// <para>A node that is ITSELF a named stream (name <c>base:stream</c>) reports the
+    /// streams of its BASE object, mirroring NTFS: querying the streams of a stream handle
+    /// lists the owning file's streams, not nothing.</para>
+    ///
+    /// <para>The volume root has no parent; its streams are the root's own stream children
+    /// (keys starting with <c>':'</c>), so they are collected directly.</para>
+    /// </summary>
+    public IReadOnlyList<(string StreamName, FileNode Node)> GetNamedStreamsForNode(FileNode node)
+    {
+        lock (_structureLock)
+        {
+            // A named stream node ("base:stream") is addressed as its base object.
+            int colon = node.Name.IndexOf(':');
+            if (colon >= 0)
             {
-                parent = _root;
-                baseName = string.Empty;
-            }
-            else
-            {
-                var (p, n) = ResolvePath(basePath);
-                if (p == null || n == null) return Array.Empty<(string, FileNode)>();
-                parent = p;
-                baseName = n;
+                var owner = node.Parent;
+                if (owner == null) return Array.Empty<(string, FileNode)>();
+                string baseName = node.Name[..colon];
+                // An empty base name means a stream on the volume root ("\:stream").
+                if (baseName.Length == 0) return StreamsOf(_root, string.Empty);
+                if (!owner.Children!.TryGetValue(baseName, out var baseNode))
+                    return Array.Empty<(string, FileNode)>();
+                node = baseNode;
             }
 
-            string prefix = baseName + ":";
-            var result = new List<(string, FileNode)>();
-            foreach (var kv in parent.Children!)
-            {
-                if (kv.Key.IndexOf(':') < 0) continue;
-                if (!kv.Key.StartsWith(prefix, StringComparison.OrdinalIgnoreCase)) continue;
-                result.Add((kv.Key[prefix.Length..], kv.Value));
-            }
-            result.Sort(static (a, b) => string.Compare(a.Item1, b.Item1, StringComparison.OrdinalIgnoreCase));
-            return result;
+            // Root: Parent is null and Name is empty; its streams live in its own Children.
+            if (ReferenceEquals(node, _root))
+                return StreamsOf(_root, string.Empty);
+
+            var parent = node.Parent;
+            if (parent?.Children == null) return Array.Empty<(string, FileNode)>();
+            return StreamsOf(parent, node.Name);
         }
+    }
+
+    /// <summary>
+    /// Collect the STREAM children of <paramref name="parent"/> whose name is
+    /// <c>baseName + ":" + ...</c> (i.e. the named streams of the sibling named
+    /// <paramref name="baseName"/>). Caller must hold <see cref="_structureLock"/>.
+    /// </summary>
+    private static IReadOnlyList<(string StreamName, FileNode Node)> StreamsOf(FileNode parent, string baseName)
+    {
+        string prefix = baseName + ":";
+        var result = new List<(string, FileNode)>();
+        foreach (var kv in parent.Children!)
+        {
+            if (kv.Key.IndexOf(':') < 0) continue;
+            if (!kv.Key.StartsWith(prefix, StringComparison.OrdinalIgnoreCase)) continue;
+            result.Add((kv.Key[prefix.Length..], kv.Value));
+        }
+        result.Sort(static (a, b) => string.Compare(a.Item1, b.Item1, StringComparison.OrdinalIgnoreCase));
+        return result;
     }
 
     /// <summary>

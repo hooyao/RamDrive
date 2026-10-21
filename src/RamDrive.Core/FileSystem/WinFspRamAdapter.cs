@@ -595,8 +595,13 @@ public sealed unsafe class WinFspRamAdapter : IFileSystem
     /// </summary>
     public int GetStreamInfo(string fileName, nint buffer, uint length, out uint bytesTransferred, FileOperationInfo info)
     {
-        string basePath = StreamPath.GetBasePath(StreamPath.Normalize(fileName));
-        var main = _fs.FindNode(basePath);
+        // Resolve the base from the OPEN HANDLE's node, not the cached pathname: WinFsp
+        // passes the handle's stored filename here and updates only the renaming handle's
+        // name, so after another handle renames the file (or its parent) the cached name
+        // is stale -- it could miss the object, or hit an unrelated one if the old name
+        // was reused. This is a handle-based callback, so Context is always the node; every
+        // other callback in this adapter uses Node(info) for the same reason.
+        var main = Node(info);
         if (main == null)
         {
             bytesTransferred = 0;
@@ -611,7 +616,7 @@ public sealed unsafe class WinFspRamAdapter : IFileSystem
             return NtStatus.Success;
         }
 
-        foreach (var (streamName, node) in _fs.GetNamedStreams(basePath))
+        foreach (var (streamName, node) in _fs.GetNamedStreamsForNode(main))
         {
             if (!AddStreamInfo(buffer, length, &written, streamName, node))
             {
