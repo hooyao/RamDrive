@@ -13,6 +13,7 @@ namespace RamDrive.IntegrationTests;
 [Collection("RamDrive")]
 public class ChaosTests(RamDriveFixture fx)
 {
+    private readonly RamDriveFixture _testFixture = fx.ResetForTest();
     enum Op
     {
         CreateFile, WriteSeek, WriteAppend, ReadVerify,
@@ -35,7 +36,7 @@ public class ChaosTests(RamDriveFixture fx)
         int durationSec = int.TryParse(Environment.GetEnvironmentVariable("CHAOS_DURATION_SEC"), out var d) ? d : 30;
         int workers = int.TryParse(Environment.GetEnvironmentVariable("CHAOS_WORKERS"), out var w) ? w : 32;
 
-        var root = Path.Combine(fx.Root, $"chaos_{Guid.NewGuid():N}");
+        var root = Path.Combine(_testFixture.Root, $"chaos_{Guid.NewGuid():N}");
         Directory.CreateDirectory(root);
 
         var world = new World(root);

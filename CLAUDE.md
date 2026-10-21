@@ -67,13 +67,14 @@ The WinFsp binding is provided by the [`WinFsp.Native`](https://www.nuget.org/pa
 
 ### RamFileSystem (FileSystem/RamFileSystem.cs)
 - Single global `_structureLock` for all tree mutations (create/delete/move)
+- The same lock owns namespace membership and open-context references. `OpenNode` and create-with-reference retain atomically; unlinked/replaced nodes keep their content until final `CloseNode`. Shutdown also reclaims retained unlinked nodes after callbacks stop.
 - `Dictionary<string, FileNode>` with `StringComparer.OrdinalIgnoreCase` for Windows paths
 - Path format: backslash separated, root is `"\"`
 
 ### WinFspRamAdapter (RamDrive.Cli/WinFspRamAdapter.cs)
 - Implements `WinFsp.Native.IFileSystem` for use with `FileSystemHost`
 - Caches `FileNode` in `FileOperationInfo.Context` to avoid repeated path lookups
-- Deletion is deferred: `CanDelete` validates; actual removal in `Cleanup` when `CleanupFlags.Delete`
+- `CanDelete` validates; `Cleanup(Delete)` unlinks by node identity, while final `Close` releases backing content. Mappings and paging writes can outlive Cleanup (issue #24).
 - `WriteFile`: `writeToEndOfFile` flag means append; `constrainedIo` clamps to logical size
 - `GetVolumeInfo`: reports "NTFS" with `PersistentAcls | CasePreservedNames | UnicodeOnDisk`
 - All hot-path methods return synchronous `ValueTask<T>` — zero managed heap allocation
@@ -158,11 +159,19 @@ java -XX:+UseParallelGC -Xmx100g -jar tla/tla2tools.jar -workers auto \
 | `DoWriteP3(f)` | `PagedFileContent.Write` Phase 3 | Write-lock |
 | `DoExtend(f, newLen)` | `PagedFileContent.SetLength` (extend) | Write-lock |
 | `DoTruncate(f, newLen)` | `PagedFileContent.SetLength` (truncate) | Write-lock |
-| `DoDelete(f)` | `PagedFileContent.Dispose` | Write-lock |
+| `DoDelete(f)` | `RamFileSystem.Delete` (unlink; retain open objects) | Structure-lock |
+| `DoOpen(f)` | `RamFileSystem.OpenNode` | Structure-lock |
+| `DoClose(f)` / `DoDispose(f)` | Last `CloseNode` after unlink, then `PagedFileContent.Dispose` | Structure-lock + write-lock |
 | `DoRead(f, p)` | `PagedFileContent.Read` | Read-lock |
 | `DoCreateFile(f)` | `RamFileSystem.CreateFile` | Structure-lock |
 | `DoSetAllocSize(f, n)` | `WinFspRamAdapter.SetFileSize` (alloc=true) | None |
 | `DoGetVolumeInfo` | `WinFspRamAdapter.GetVolumeInfo` | None |
+
+`fileAlive` means backing-object lifetime; `fileLinked` and `fileOpenRefs` model
+namespace ownership and retained contexts separately. Run `tla/Verify-Lifetime.ps1`
+for bounded pool/lifetime checks and the original eager-disposal counterexample.
+`tla/FileObjectLifetime.tla` additionally covers mappings, name reuse and replacement;
+see `tla/FILE_OBJECT_LIFETIME.md` for bounds, fairness assumptions and larger runs.
 
 ### Modeling guidelines
 

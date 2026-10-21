@@ -17,6 +17,7 @@ jobs:
     outputs:
       code: ${{ steps.filter.outputs.code }}
       installer: ${{ steps.filter.outputs.installer }}
+      formal: ${{ steps.filter.outputs.formal }}
     steps:
       - uses: actions/checkout@v4
 
@@ -37,6 +38,35 @@ jobs:
             installer:
               - 'setup/**'
               - '.github/workflows/ci.yml'
+            formal:
+              - 'tla/**'
+              - 'src/RamDrive.Core/**'
+              - '.github/workflows/ci.yml'
+
+  model-check-lifetime:
+    needs: changes
+    if: needs.changes.outputs.formal == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - name: Download TLC
+        run: curl -fLsS -o tla/tla2tools.jar https://github.com/tlaplus/tlaplus/releases/download/v1.8.0/tla2tools.jar
+      - name: Verify lifetime models and original-bug counterexample
+        shell: pwsh
+        run: ./tla/Verify-Lifetime.ps1 -Workers 4
+      - name: Upload model-check logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: lifetime-model-checks
+          path: |
+            artifacts/tla-lifetime/*.log
+            artifacts/tla-lifetime/results.json
+          retention-days: 14
 
   build-and-test:
     needs: changes

@@ -25,7 +25,7 @@ public class DirectoryEnumerationTests : IDisposable
 
     public DirectoryEnumerationTests(RamDriveFixture fx)
     {
-        _root = Path.Combine(fx.Root, $"direnum_{Guid.NewGuid():N}");
+        _root = Path.Combine(fx.ResetForTest().Root, $"direnum_{Guid.NewGuid():N}");
         Directory.CreateDirectory(_root);
     }
 

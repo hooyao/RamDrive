@@ -13,15 +13,15 @@
 \* more page holes than Phase 1 predicted, triggering the Phase 3
 \* deficit fallback path in code.
 \*
-\* Move/Rename is NOT modeled because it only mutates the directory tree
-\* under _structureLock (atomic, serialized) and does not touch page tables
-\* or pool state. No concurrency hazard beyond the structure lock.
+\* Linkage and open contexts are separate from backing-object lifetime.
+\* Rename/replacement namespace identity is checked in FileObjectLifetime;
+\* releasing a replaced object's storage follows the same final-close action here.
 
 EXTENDS Integers, FiniteSets, Sequences, TLC
 
-CONSTANTS MaxPages, NumFiles
+CONSTANTS MaxPages, NumFiles, MaxOpenReferences
 
-ASSUME MaxPages > 0 /\ NumFiles > 0
+ASSUME MaxPages > 0 /\ NumFiles > 0 /\ MaxOpenReferences >= 0
 
 Files == 1..NumFiles
 PageIndices == 0..(MaxPages - 1)
@@ -39,7 +39,9 @@ VARIABLES
     \* ── Per-file state ──
     fileLength,       \* Logical length in pages (sparse: pages may be unallocated)
     filePages,        \* Sparse page table: [pageIndex -> DataValues]
-    fileAlive,        \* TRUE = file exists, FALSE = deleted
+    fileAlive,        \* Backing content is live, including retained unlinked files
+    fileLinked,       \* Visible in the namespace
+    fileOpenRefs,     \* Retained WinFsp contexts (released by Close, not Cleanup)
     fileReserved,     \* Pages reserved in pool but not yet allocated (per-file)
 
     \* ── Per-file operation state machine ──
@@ -58,11 +60,13 @@ VARIABLES
     \* ── External observer ──
     observedFree      \* Last GetVolumeInfo result (in pages)
 
-vars == <<poolAllocated, poolRented,
+memoryVars == <<poolAllocated, poolRented,
           fileLength, filePages, fileAlive, fileReserved,
           fileOp, writeTarget, writePreAlloc, writeRange,
           lastReadFile, lastReadVal, allocResult,
           observedFree>>
+
+vars == <<memoryVars, fileLinked, fileOpenRefs>>
 
 OpStates == {"idle", "w_p1", "w_p2"}
 
@@ -114,6 +118,8 @@ TypeOK ==
     /\ fileLength \in [Files -> 0..MaxPages]
     /\ filePages \in [Files -> [PageIndices -> DataValues]]
     /\ fileAlive \in [Files -> BOOLEAN]
+    /\ fileLinked \in [Files -> BOOLEAN]
+    /\ fileOpenRefs \in [Files -> 0..MaxOpenReferences]
     /\ fileReserved \in [Files -> 0..MaxPages]
     /\ fileOp \in [Files -> OpStates]
     /\ writeTarget \in [Files -> SUBSET PageIndices]
@@ -133,6 +139,8 @@ Init ==
     /\ fileLength = [f \in Files |-> 0]
     /\ filePages = [f \in Files |-> [p \in PageIndices |-> 0]]
     /\ fileAlive = [f \in Files |-> TRUE]
+    /\ fileLinked = [f \in Files |-> TRUE]
+    /\ fileOpenRefs = [f \in Files |-> 0]
     /\ fileReserved = [f \in Files |-> 0]
     /\ fileOp = [f \in Files |-> "idle"]
     /\ writeTarget = [f \in Files |-> {}]
@@ -151,6 +159,8 @@ DoCreateFile(f) ==
     /\ ~fileAlive[f]
     /\ fileOp[f] = "idle"
     /\ fileAlive' = [fileAlive EXCEPT ![f] = TRUE]
+    /\ fileLinked' = [fileLinked EXCEPT ![f] = TRUE]
+    /\ fileOpenRefs' = [fileOpenRefs EXCEPT ![f] = 0]
     /\ fileLength' = [fileLength EXCEPT ![f] = 0]
     \* filePages already all 0 from DoDelete (enforced by DeadFilesClean)
     /\ UNCHANGED <<poolAllocated, poolRented, filePages, fileReserved,
@@ -404,11 +414,11 @@ DoTruncate(f, newLen) ==
                        lastReadFile, lastReadVal, allocResult, observedFree>>
 
 (* ================================================================
-   Delete: dispose file, return all pages (structure-lock + write-lock)
+   Final disposal: return all pages (structure-lock + write-lock)
    Releases all reservations.
-   Only when idle — an open write handle prevents deletion.
+   Only when idle — a final Close cannot overlap an active callback.
    ================================================================ *)
-DoDelete(f) ==
+DoDispose(f) ==
     /\ fileOp[f] = "idle"
     /\ fileAlive[f]
     /\ LET freed == Cardinality({p \in PageIndices : filePages[f][p] # 0})
@@ -422,6 +432,29 @@ DoDelete(f) ==
        /\ UNCHANGED <<poolAllocated,
                        fileOp, writeTarget, writePreAlloc, writeRange,
                        lastReadFile, lastReadVal, allocResult, observedFree>>
+
+\* Cleanup removes the name; an open context retains the backing data.
+DoDelete(f) ==
+    /\ fileLinked[f]
+    /\ (fileOp[f] = "idle" \/ fileOpenRefs[f] > 0)
+    /\ fileLinked' = [fileLinked EXCEPT ![f] = FALSE]
+    /\ UNCHANGED fileOpenRefs
+    /\ IF fileOpenRefs[f] = 0 THEN DoDispose(f)
+       ELSE UNCHANGED memoryVars
+
+DoOpen(f) ==
+    /\ fileLinked[f]
+    /\ fileOpenRefs[f] < MaxOpenReferences
+    /\ fileOpenRefs' = [fileOpenRefs EXCEPT ![f] = @ + 1]
+    /\ UNCHANGED <<memoryVars, fileLinked>>
+
+DoClose(f) ==
+    /\ fileOpenRefs[f] > 0
+    /\ fileOp[f] = "idle"
+    /\ fileOpenRefs' = [fileOpenRefs EXCEPT ![f] = @ - 1]
+    /\ UNCHANGED fileLinked
+    /\ IF ~fileLinked[f] /\ fileOpenRefs[f] = 1 THEN DoDispose(f)
+       ELSE UNCHANGED memoryVars
 
 (* ================================================================
    OverwriteFile: truncate to 0, then check allocationSize (write-lock)
@@ -484,9 +517,8 @@ DoGetVolumeInfo ==
 (* ================================================================
    Spec
    ================================================================ *)
-Next ==
+MemoryNext ==
     \/ \E f \in Files :
-        \/ DoCreateFile(f)
         \/ \E pages \in (SUBSET (0..(MaxPages - 1)) \ {{}}) :
                DoWriteP1(f, pages)
         \/ DoWriteP2(f)
@@ -494,19 +526,23 @@ Next ==
         \/ \E p \in PageIndices : DoRead(f, p)
         \/ \E newLen \in 1..MaxPages : DoExtend(f, newLen)
         \/ \E newLen \in 0..(MaxPages - 1) : DoTruncate(f, newLen)
-        \/ DoDelete(f)
         \/ \E allocSize \in 0..MaxPages : DoOverwrite(f, allocSize)
         \/ \E reqLen \in 1..MaxPages : DoSetAllocSize(f, reqLen)
     \/ DoGetVolumeInfo
     \* Stuttering when quiescent
     \/ /\ \A f \in Files : fileOp[f] = "idle"
-       /\ UNCHANGED vars
+       /\ UNCHANGED memoryVars
+
+Next ==
+    \/ /\ MemoryNext
+       /\ UNCHANGED <<fileLinked, fileOpenRefs>>
+    \/ \E f \in Files : DoCreateFile(f) \/ DoDelete(f) \/ DoOpen(f) \/ DoClose(f)
 
 Fairness == \A f \in Files :
     /\ \A pages \in (SUBSET (0..(MaxPages - 1)) \ {{}}) :
-           WF_vars(DoWriteP1(f, pages))
-    /\ WF_vars(DoWriteP2(f))
-    /\ WF_vars(DoWriteP3(f))
+           WF_vars(DoWriteP1(f, pages) /\ UNCHANGED <<fileLinked, fileOpenRefs>>)
+    /\ WF_vars(DoWriteP2(f) /\ UNCHANGED <<fileLinked, fileOpenRefs>>)
+    /\ WF_vars(DoWriteP3(f) /\ UNCHANGED <<fileLinked, fileOpenRefs>>)
 
 Spec == Init /\ [][Next]_vars /\ Fairness
 
@@ -563,6 +599,10 @@ DeadFilesClean ==
         /\ fileLength[f] = 0
         /\ fileReserved[f] = 0
         /\ \A p \in PageIndices : filePages[f][p] = 0
+
+\* Namespace removal alone must never kill a retained backing object.
+LifetimeSafe ==
+    \A f \in Files : fileAlive[f] = (fileLinked[f] \/ fileOpenRefs[f] > 0)
 
 (* ================================================================
    Liveness

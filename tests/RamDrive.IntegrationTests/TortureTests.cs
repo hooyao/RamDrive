@@ -5,7 +5,7 @@ namespace RamDrive.IntegrationTests;
 [Collection("RamDrive")]
 public class TortureTests(RamDriveFixture fx) : IDisposable
 {
-    private readonly string _root = Path.Combine(fx.Root, $"t_{Guid.NewGuid():N}");
+    private readonly string _root = Path.Combine(fx.ResetForTest().Root, $"t_{Guid.NewGuid():N}");
 
     void EnsureRoot() => Directory.CreateDirectory(_root);
 

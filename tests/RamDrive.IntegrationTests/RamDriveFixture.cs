@@ -24,14 +24,31 @@ namespace RamDrive.IntegrationTests;
 [SupportedOSPlatform("windows")]
 public sealed class RamDriveFixture : IDisposable
 {
-    public string Root { get; }
+    public string Root { get; private set; } = string.Empty;
     public long CapacityMb { get; } = 512;
 
-    private readonly PagePool _pool;
-    private readonly RamFileSystem _fs;
-    private readonly FileSystemHost _host;
+    private PagePool _pool = null!;
+    private RamFileSystem _fs = null!;
+    private FileSystemHost _host = null!;
+    private int _generation;
+    private bool _disposed;
 
-    public RamDriveFixture()
+    public RamDriveFixture() => Mount();
+
+    /// <summary>
+    /// Each serialized test starts with its own volume. Clean kernel cache references
+    /// can retain deleted backing objects until Close; they must not consume the next
+    /// test's capacity or require premature disposal to make the suite pass.
+    /// </summary>
+    public RamDriveFixture ResetForTest()
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        StopMount();
+        Mount();
+        return this;
+    }
+
+    private void Mount()
     {
         var options = new RamDriveOptions
         {
@@ -60,14 +77,14 @@ public sealed class RamDriveFixture : IDisposable
         }
 
         _host = new FileSystemHost(adapter);
-        _host.Prefix = $@"\winfsp-tests\itest-{Environment.ProcessId}";
+        string share = $"itest-{Environment.ProcessId}-{++_generation}";
+        _host.Prefix = $@"\winfsp-tests\{share}";
 
         int result = _host.Mount(null);
         if (result < 0)
             throw new InvalidOperationException($"WinFsp mount failed: 0x{result:X8}. Is WinFsp installed?");
 
-        Root = _host.MountPoint!;
-        if (!Root.EndsWith('\\')) Root += @"\";
+        Root = $@"\\winfsp-tests\{share}\";
     }
 
     public void CleanRoot()
@@ -80,9 +97,16 @@ public sealed class RamDriveFixture : IDisposable
 
     public void Dispose()
     {
-        _host.Dispose();
-        _fs.Dispose();
-        _pool.Dispose();
+        if (_disposed) return;
+        _disposed = true;
+        StopMount();
+    }
+
+    private void StopMount()
+    {
+        _host?.Dispose();
+        _fs?.Dispose();
+        _pool?.Dispose();
     }
 }
 

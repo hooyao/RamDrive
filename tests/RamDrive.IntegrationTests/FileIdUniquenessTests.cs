@@ -49,7 +49,7 @@ internal static partial class FileIdWin32
 [SupportedOSPlatform("windows")]
 public class FileIdUniquenessTests(RamDriveFixture fx) : IDisposable
 {
-    private readonly string _dir = Path.Combine(fx.Root, $"fileid_{Guid.NewGuid():N}");
+    private readonly string _dir = Path.Combine(fx.ResetForTest().Root, $"fileid_{Guid.NewGuid():N}");
 
     public void Dispose() { try { Directory.Delete(_dir, true); } catch { } }
 

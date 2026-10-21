@@ -12,6 +12,8 @@ public sealed class RamFileSystem : IDisposable
     private readonly PagePool _pool;
     private readonly FileNode _root;
     private readonly object _structureLock = new();
+    private readonly HashSet<FileNode> _unlinkedNodes = new();
+    private bool _disposed;
 
     public RamFileSystem(PagePool pool)
     {
@@ -35,6 +37,8 @@ public sealed class RamFileSystem : IDisposable
     /// <summary>
     /// Resolve a path to a FileNode. Returns null if not found.
     /// Path uses backslash separator (Dokan convention). "\" is root.
+    /// This is a borrowed namespace lookup; use OpenNode/CloseNode to retain
+    /// backing content across concurrent unlink or replacement.
     /// </summary>
     public FileNode? FindNode(string path)
     {
@@ -44,19 +48,55 @@ public sealed class RamFileSystem : IDisposable
         }
     }
 
+    /// <summary>Find a linked node and retain its open context atomically with lookup.</summary>
+    public FileNode? OpenNode(string path)
+    {
+        lock (_structureLock)
+        {
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            var node = FindNodeInternal(path);
+            if (node != null) node.OpenReferences++;
+            return node;
+        }
+    }
+
+    /// <summary>Release an open context. Unlinked data survives until the final Close.</summary>
+    public void CloseNode(FileNode node)
+    {
+        lock (_structureLock)
+        {
+            // Shutdown follows host stop and has already reclaimed every retained node.
+            if (_disposed) return;
+            if (node.OpenReferences <= 0)
+                throw new InvalidOperationException("The node has no retained open context.");
+            node.OpenReferences--;
+            if (!node.IsLinked && node.OpenReferences == 0)
+            {
+                _unlinkedNodes.Remove(node);
+                node.Dispose();
+            }
+        }
+    }
+
     /// <summary>
     /// Create a file at the given path. Parent directory must exist.
     /// Returns the new FileNode, or null if parent not found or name already exists.
     /// </summary>
     public FileNode? CreateFile(string path, byte[]? securityDescriptor = null)
+        => CreateFile(path, securityDescriptor, acquireReference: false);
+
+    /// <summary>Create with an optional open reference that must be released with CloseNode.</summary>
+    public FileNode? CreateFile(string path, byte[]? securityDescriptor, bool acquireReference)
     {
         lock (_structureLock)
         {
+            ObjectDisposedException.ThrowIf(_disposed, this);
             var (parent, name) = ResolvePath(path);
             if (parent == null || !parent.IsDirectory || name == null) return null;
             if (parent.Children!.ContainsKey(name)) return null;
 
             var node = FileNode.CreateFile(name, _pool);
+            if (acquireReference) node.OpenReferences = 1;
             // When the caller does not supply an SD, inherit the parent's by reference.
             // Copy-on-write contract: SetFileSecurity allocates a fresh byte[] before
             // assigning, so this share is broken on the first explicit ACL change.
@@ -73,14 +113,20 @@ public sealed class RamFileSystem : IDisposable
     /// Returns the new FileNode, or null if parent not found or name already exists.
     /// </summary>
     public FileNode? CreateDirectory(string path, byte[]? securityDescriptor = null)
+        => CreateDirectory(path, securityDescriptor, acquireReference: false);
+
+    /// <summary>Create with an optional open reference that must be released with CloseNode.</summary>
+    public FileNode? CreateDirectory(string path, byte[]? securityDescriptor, bool acquireReference)
     {
         lock (_structureLock)
         {
+            ObjectDisposedException.ThrowIf(_disposed, this);
             var (parent, name) = ResolvePath(path);
             if (parent == null || !parent.IsDirectory || name == null) return null;
             if (parent.Children!.ContainsKey(name)) return null;
 
             var node = FileNode.CreateDirectory(name);
+            if (acquireReference) node.OpenReferences = 1;
             // See CreateFile for the inherit-by-reference / copy-on-write contract.
             node.SecurityDescriptor = securityDescriptor ?? parent.SecurityDescriptor;
             node.Parent = parent;
@@ -98,19 +144,33 @@ public sealed class RamFileSystem : IDisposable
         lock (_structureLock)
         {
             var node = FindNodeInternal(path);
-            if (node == null || node == _root) return false;
-
-            if (node.IsDirectory && node.Children!.Count > 0) return false;
-
-            var parent = node.Parent;
-            if (parent?.Children?.Remove(node.Name) == true)
-            {
-                parent.LastWriteTime = DateTime.UtcNow;
-                node.Dispose();
-                return true;
-            }
-            return false;
+            return node != null && UnlinkNode(node);
         }
+    }
+
+    /// <summary>Unlink this exact object, without deleting a new occupant of its old name.</summary>
+    public bool Delete(FileNode node)
+    {
+        lock (_structureLock)
+            return !_disposed && UnlinkNode(node);
+    }
+
+    private bool UnlinkNode(FileNode node)
+    {
+        if (node == _root || !node.IsLinked ||
+            (node.IsDirectory && node.Children!.Count > 0)) return false;
+        var parent = node.Parent;
+        if (parent?.Children == null ||
+            !parent.Children.TryGetValue(node.Name, out var current) ||
+            !ReferenceEquals(current, node)) return false;
+
+        parent.Children.Remove(node.Name);
+        parent.LastWriteTime = DateTime.UtcNow;
+        node.Parent = null;
+        node.IsLinked = false;
+        if (node.OpenReferences == 0) node.Dispose();
+        else _unlinkedNodes.Add(node);
+        return true;
     }
 
     /// <summary>
@@ -120,6 +180,7 @@ public sealed class RamFileSystem : IDisposable
     {
         lock (_structureLock)
         {
+            ObjectDisposedException.ThrowIf(_disposed, this);
             var sourceNode = FindNodeInternal(oldPath);
             if (sourceNode == null || sourceNode == _root) return false;
 
@@ -128,9 +189,10 @@ public sealed class RamFileSystem : IDisposable
 
             if (newParent.Children!.TryGetValue(newName, out var existing))
             {
-                if (!replace) return false;
-                if (existing.IsDirectory && existing.Children!.Count > 0) return false;
-                existing.Dispose();
+                if (!ReferenceEquals(existing, sourceNode))
+                {
+                    if (!replace || !UnlinkNode(existing)) return false;
+                }
             }
 
             var oldParent = sourceNode.Parent;
@@ -167,7 +229,11 @@ public sealed class RamFileSystem : IDisposable
     {
         lock (_structureLock)
         {
+            if (_disposed) return;
+            _disposed = true;
             _root.Dispose();
+            foreach (var node in _unlinkedNodes) node.Dispose();
+            _unlinkedNodes.Clear();
         }
     }
 
