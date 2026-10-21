@@ -110,3 +110,9 @@ was ready for review/archive at the end of local verification. The completed
 change was subsequently synced to `openspec/specs/file-object-lifetime/spec.md`
 and archived before opening the PR, so the specification and implementation are
 reviewed together. GitHub review and release results are recorded in the PR.
+
+Copilot round 1 reported no concrete defect but requested closer review of the
+Windows callback-ordering dependency. Source review confirmed the Cleanup/Close
+contract, binding handle-state release and dispatcher joins; pinned source links
+and the limits of the model assumptions are recorded in
+`tla/FILE_OBJECT_LIFETIME.md`. No runtime change was needed for that concern.

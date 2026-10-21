@@ -20,3 +20,7 @@
 - [x] 4.2 Run bounded TLC fixed configurations and confirm the old-behavior configuration fails the intended invariant; record incomplete larger runs separately.
 - [x] 4.3 Repeat native-client and real-drive VS acceptance with EnableKernelCache on/off; save evidence and clean all mounts.
 - [x] 4.4 Validate OpenSpec and verify implementation/scenario coverage against the completed change artifacts.
+
+## 5. PR review follow-ups
+
+- [x] 5.1 Review Copilot's callback-ordering concern against pinned WinFsp/WinFsp.Native source and document the external contract, dispatcher shutdown and regression evidence in `tla/FILE_OBJECT_LIFETIME.md`.

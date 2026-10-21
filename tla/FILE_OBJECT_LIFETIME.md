@@ -36,6 +36,34 @@ Shutdown is outside the running-callback model: the host first stops callbacks,
 then the filesystem deterministically disposes the linked tree and retained set.
 Core tests verify this boundary and idempotent cleanup.
 
+## Callback-ordering review
+
+The no-I/O-after-final-Close boundary is an external WinFsp contract, not a
+property proved about Windows by TLC. Review against the installed WinFsp
+2.1.25156 driver and the pinned WinFsp.Native 0.1.3-pre.1 binding confirms:
+
+- WinFsp's [Cleanup contract](https://github.com/winfsp/winfsp/blob/ddca7bd5481857a65ba552f643b8776fd070836f/inc/winfsp/winfsp.h#L357-L360)
+  explicitly requires accepting more operations until Close, even after deletion.
+  The [kernel close path](https://github.com/winfsp/winfsp/blob/ddca7bd5481857a65ba552f643b8776fd070836f/src/sys/close.c#L62-L115)
+  posts the user-mode Close from IRP_MJ_CLOSE, separately from Cleanup. Close can
+  be omitted during volume teardown, so shutdown must reclaim retained nodes.
+- The binding [retains the same handle state through Cleanup and releases it in Close](https://github.com/hooyao/winfsp-native/blob/5a0dd4d4888dcccaf355127faeed804d2b7f3875/src/WinFsp.Native/FileSystemHost.cs#L423-L447).
+  RamDrive retains one node reference per successful create/open context and
+  releases it in that Close callback. Late synchronous paging I/O uses the
+  retained context directly; Cleanup cancellation does not skip those writes.
+- Shutdown stops dispatch before disposing native content. The binding
+  [stops the dispatcher before deleting the filesystem](https://github.com/hooyao/winfsp-native/blob/5a0dd4d4888dcccaf355127faeed804d2b7f3875/src/WinFsp.Native/WinFspFileSystem.cs#L167-L175);
+  WinFsp [joins its dispatcher](https://github.com/winfsp/winfsp/blob/ddca7bd5481857a65ba552f643b8776fd070836f/src/dll/fs.c#L417-L434)
+  and each dispatcher [joins its child](https://github.com/winfsp/winfsp/blob/ddca7bd5481857a65ba552f643b8776fd070836f/src/dll/fs.c#L346-L359).
+  The CLI stops its host before DI disposes the filesystem/pool; the test fixture
+  uses explicit host, filesystem, pool disposal order.
+
+Structure-lock ownership prevents open/unlink/final-release races. Mounted
+mapping regressions and real-drive VS acceptance exercise the external callback
+boundary; core regressions test final-release accounting and stopped-host
+shutdown. Changes to the binding's callback lifetime or asynchronous RamDrive
+callbacks would require reviewing these assumptions again.
+
 ## Reproducible bounded checks
 
 Requires Java 11+ and the TLC JAR documented in `RUN_FULL_VERIFICATION.md`.
