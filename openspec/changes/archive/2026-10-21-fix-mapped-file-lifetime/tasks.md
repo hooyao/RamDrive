@@ -24,3 +24,4 @@
 ## 5. PR review follow-ups
 
 - [x] 5.1 Review Copilot's callback-ordering concern against pinned WinFsp/WinFsp.Native source and document the external contract, dispatcher shutdown and regression evidence in `tla/FILE_OBJECT_LIFETIME.md`.
+- [x] 5.2 Bound the 100-worker mixed workload within both backends' capacity semantics after CI exposed a DiskFull mismatch; keep strict differential comparison and separate capacity tests, and rerun all 10 differential torture cases.

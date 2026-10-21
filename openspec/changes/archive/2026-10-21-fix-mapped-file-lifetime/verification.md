@@ -116,3 +116,14 @@ Windows callback-ordering dependency. Source review confirmed the Cleanup/Close
 contract, binding handle-state release and dispatcher joins; pinned source links
 and the limits of the model assumptions are recorded in
 `tla/FILE_OBJECT_LIFETIME.md`. No runtime change was needed for that concern.
+
+The first remote CI run passed Core 65/65 and integration 51/51, but the
+differential mixed workload exceeded RamDrive's shared pool and produced
+DiskFull/success mismatches against MEMFS, whose allocation limit is per-file.
+Time-only workers could continue allocating while deleted files remained cached;
+callback errors then caused kernel retries. The run was stopped and its log
+preserved locally. The mixed test now retains 100 workers and every operation
+type, with explicit iteration bounds totaling at most 385 MiB of native pages
+even if no deleted object's final Close arrives. The 512 MiB volume, strict
+status comparison, capacity-pressure test and pool-limit tests are unchanged.
+All **10 differential torture tests** passed after this adjustment (18 seconds).

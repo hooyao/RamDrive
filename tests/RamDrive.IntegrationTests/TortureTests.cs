@@ -281,12 +281,18 @@ public class TortureTests(RamDriveFixture fx) : IDisposable
         var errors = new System.Collections.Concurrent.ConcurrentBag<Exception>();
         var writtenFiles = new System.Collections.Concurrent.ConcurrentBag<string>();
 
-        Task MakeWorkers(int n, Action<int, int, Random> body) =>
+        // Bound allocation even if Windows retains every deleted file until the
+        // volume stops. At 64 KiB per page the worst case is 385 MiB:
+        // writers 240 + churn 80 + directory files 45 + rename files 20.
+        // Capacity limits are covered separately by CapacityPressure and the
+        // PagePool tests. MEMFS has a per-file limit, not RamDrive's shared
+        // page-pool limit, so the differential workload must fit both backends.
+        Task MakeWorkers(int n, int maxIterations, Action<int, int, Random> body) =>
             Task.WhenAll(Enumerable.Range(0, n).Select(id => Task.Run(() =>
             {
                 var rng = new Random(id * 31 + Environment.TickCount);
                 int iter = 0;
-                while (!cts.IsCancellationRequested)
+                while (iter < maxIterations && !cts.IsCancellationRequested)
                 {
                     try { body(id, iter++, rng); }
                     catch (IOException) { }
@@ -295,7 +301,7 @@ public class TortureTests(RamDriveFixture fx) : IDisposable
                 }
             }, cts.Token)));
 
-        var writers = MakeWorkers(30, (id, iter, rng) =>
+        var writers = MakeWorkers(30, 4, (id, iter, rng) =>
         {
             int sz = rng.Next(100 * 1024, 2 * 1024 * 1024);
             var buf = new byte[sz]; Fill(buf, id * 10000 + iter, 0);
@@ -305,7 +311,7 @@ public class TortureTests(RamDriveFixture fx) : IDisposable
             writtenFiles.Add(p);
         });
 
-        var readers = MakeWorkers(30, (id, iter, rng) =>
+        var readers = MakeWorkers(30, 1000, (id, iter, rng) =>
         {
             var files = writtenFiles.ToArray();
             if (files.Length == 0) { Thread.Sleep(10); return; }
@@ -313,7 +319,7 @@ public class TortureTests(RamDriveFixture fx) : IDisposable
             if (File.Exists(p)) _ = File.ReadAllBytes(p);
         });
 
-        var churners = MakeWorkers(20, (id, iter, rng) =>
+        var churners = MakeWorkers(20, 64, (id, iter, rng) =>
         {
             var p = Path.Combine(mix, $"ch_{id}_{iter}.dat");
             var buf = new byte[4096]; Fill(buf, id + 1000, iter);
@@ -322,7 +328,7 @@ public class TortureTests(RamDriveFixture fx) : IDisposable
             File.Delete(p);
         });
 
-        var dirBuilders = MakeWorkers(10, (id, iter, rng) =>
+        var dirBuilders = MakeWorkers(10, 8, (id, iter, rng) =>
         {
             var tr = Path.Combine(mix, $"dt_{id}_{iter}");
             for (int a = 0; a < 3; a++) for (int b = 0; b < 3; b++)
@@ -333,7 +339,7 @@ public class TortureTests(RamDriveFixture fx) : IDisposable
             Directory.Delete(tr, true);
         });
 
-        var renamers = MakeWorkers(10, (id, iter, rng) =>
+        var renamers = MakeWorkers(10, 32, (id, iter, rng) =>
         {
             var pA = Path.Combine(mix, $"rn_{id}_{iter}_a.dat");
             var pB = Path.Combine(mix, $"rn_{id}_{iter}_b.dat");
