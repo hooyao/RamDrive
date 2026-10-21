@@ -261,12 +261,7 @@ public sealed class RamFileSystem : IDisposable
     {
         // Named streams are attached data, not directory entries: a directory whose only
         // "children" are streams (keys containing ':') is still empty and deletable.
-        if (node == _root || !node.IsLinked) return false;
-        if (node.IsDirectory)
-        {
-            foreach (var child in node.Children!)
-                if (child.Key.IndexOf(':') < 0) return false;
-        }
+        if (node == _root || !node.IsLinked || !IsEmptyForDeletionUnlocked(node)) return false;
         var parent = node.Parent;
         if (parent?.Children == null ||
             !parent.Children.TryGetValue(node.Name, out var current) ||
@@ -384,6 +379,30 @@ public sealed class RamFileSystem : IDisposable
                 .OrderBy(n => n.Name, StringComparer.OrdinalIgnoreCase)
                 .ToList();
         }
+    }
+
+    /// <summary>
+    /// True when a directory carries no deletable entries. Named streams are attached
+    /// data and do not count. Takes the structure lock and works on the node itself, so a
+    /// caller holding a handle (rather than a pathname) can ask safely: enumerating
+    /// <c>Children</c> outside the lock, or re-resolving a cached pathname, races the
+    /// create/move/delete paths. Non-directories are always "empty" for deletion.
+    /// </summary>
+    public bool IsEmptyForDeletion(FileNode node)
+    {
+        lock (_structureLock)
+        {
+            return IsEmptyForDeletionUnlocked(node);
+        }
+    }
+
+    /// <summary>Caller must hold <see cref="_structureLock"/>.</summary>
+    private static bool IsEmptyForDeletionUnlocked(FileNode node)
+    {
+        if (!node.IsDirectory) return true;
+        foreach (var child in node.Children!)
+            if (child.Key.IndexOf(':') < 0) return false;
+        return true;
     }
 
     public void Dispose()

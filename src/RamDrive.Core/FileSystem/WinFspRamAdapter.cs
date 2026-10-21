@@ -531,18 +531,14 @@ public sealed unsafe class WinFspRamAdapter : IFileSystem
         if (node == null)
             return V(NtStatus.ObjectNameNotFound);
 
-        if (node.IsDirectory)
+        // Asked through the handle's node, not the pathname, and under the structure
+        // lock: enumerating Children here directly would race create/move/delete and
+        // throw instead of returning a status. Named streams are attached data and do
+        // not make a directory non-empty.
+        if (!_fs.IsEmptyForDeletion(node))
         {
-            // Named streams are attached data, not directory entries — they do not make a
-            // directory non-empty.
-            foreach (var child in node.Children!)
-            {
-                if (child.Key.IndexOf(':') < 0)
-                {
-                    FsTracer.Trace("CanDelete-NotEmpty", fileName, $"children={node.Children!.Count}");
-                    return V(NtStatus.DirectoryNotEmpty);
-                }
-            }
+            FsTracer.Trace("CanDelete-NotEmpty", fileName, $"children={node.Children!.Count}");
+            return V(NtStatus.DirectoryNotEmpty);
         }
 
         FsTracer.Trace("CanDelete", fileName);
