@@ -387,4 +387,49 @@ public sealed class AlternateDataStreamsTests : IDisposable
         File.Exists(file + ":\"a:b\"").Should().BeFalse();
         File.ReadAllText(file).Should().Be("MAIN");
     }
+
+    // ─── The :$DATA type suffix ──────────────────────────────────────────────
+
+    [Fact]
+    public void The_explicit_main_stream_form_reads_the_main_stream()
+    {
+        // "f::$DATA" is the main stream spelled with its type; it must be the same
+        // stream as "f". Only the FIRST colon separates the name, the second the type.
+        string file = Path.Combine(_dir, "a.txt");
+        File.WriteAllText(file, "MAIN");
+
+        File.ReadAllText(file + "::$DATA").Should().Be("MAIN");
+    }
+
+    [Fact]
+    public void A_stream_literally_named_DATA_does_not_overwrite_the_main_stream()
+    {
+        // Regression: "$DATA" in the NAME position is an ordinary stream name, not the
+        // main stream. Collapsing it to the base made this write destroy the file's
+        // main content (and the stream was never created).
+        string file = Path.Combine(_dir, "a.txt");
+        File.WriteAllText(file, "MAIN");
+
+        File.WriteAllText(file + ":$DATA", "DOLLAR");
+
+        File.ReadAllText(file).Should().Be("MAIN", "the main stream must be untouched");
+        File.ReadAllText(file + ":$DATA").Should().Be("DOLLAR", "the literal $DATA stream was created");
+        // Two distinct streams now exist: the main stream and "$DATA".
+        EnumStreams(file).Select(s => s.Name)
+            .Should().BeEquivalentTo(new[] { "::$DATA", ":$DATA:$DATA" });
+    }
+
+    [Fact]
+    public void A_named_stream_type_suffix_is_optional()
+    {
+        // "f:s1:$DATA" is the same stream as "f:s1".
+        string file = Path.Combine(_dir, "a.txt");
+        File.WriteAllText(file, "MAIN");
+
+        File.WriteAllText(file + ":s1:$DATA", "S1");
+
+        File.ReadAllText(file + ":s1").Should().Be("S1");
+        File.ReadAllText(file + ":s1:$DATA").Should().Be("S1");
+        File.ReadAllText(file).Should().Be("MAIN");
+    }
 }
