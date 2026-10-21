@@ -167,6 +167,46 @@ public sealed class AlternateDataStreamsTests : IDisposable
         EnumStreams(file).Should().ContainSingle().Which.Should().Be(("::$DATA", 4L));
     }
 
+    [Fact]
+    public void FindFirstStream_on_a_stream_path_lists_the_base_files_streams()
+    {
+        // A stream-addressed query must list the owning file's streams (NTFS behavior),
+        // not the stream's own (non-existent) sub-streams.
+        string file = Path.Combine(_dir, "a.txt");
+        File.WriteAllText(file, "MAIN");
+        File.WriteAllText(file + ":s1", "AAAA");
+        File.WriteAllText(file + ":s2", "BB");
+
+        EnumStreams(file + ":s1").Select(s => s.Name)
+            .Should().BeEquivalentTo(new[] { "::$DATA", ":s1:$DATA", ":s2:$DATA" });
+    }
+
+    [Fact]
+    public void Streams_are_enumerable_after_the_file_is_renamed_with_a_handle_open()
+    {
+        // End-to-end sanity for the GetStreamInfo identity change: after a rename the
+        // streams must still enumerate and read through the renamed path while a handle
+        // from before the rename is still open. The stale-name state this fix removes
+        // lives in WinFsp's per-handle bookkeeping and is not reachable through the Win32
+        // path API, so this cannot fail on the old code -- the regression that can is the
+        // volume-root case (The_volume_root_can_carry_named_streams), plus the identity
+        // cases pinned in RamDrive.Core.Tests/GetNamedStreamsForNodeTests.cs.
+        string file = Path.Combine(_dir, "orig.txt");
+        string renamed = Path.Combine(_dir, "renamed.txt");
+        File.WriteAllText(file, "MAIN");
+        File.WriteAllText(file + ":s1", "S1");
+
+        using (var held = new FileStream(file, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete))
+        {
+            File.Move(file, renamed);
+
+            EnumStreams(renamed).Select(s => s.Name)
+                .Should().BeEquivalentTo(new[] { "::$DATA", ":s1:$DATA" });
+            File.ReadAllText(renamed + ":s1").Should().Be("S1");
+            File.ReadAllText(renamed).Should().Be("MAIN");
+        }
+    }
+
     // ─── Lifecycle: delete / move ────────────────────────────────────────────
 
     [Fact]
