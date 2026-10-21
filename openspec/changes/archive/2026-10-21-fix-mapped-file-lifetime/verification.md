@@ -127,3 +127,10 @@ type, with explicit iteration bounds totaling at most 385 MiB of native pages
 even if no deleted object's final Close arrives. The 512 MiB volume, strict
 status comparison, capacity-pressure test and pool-limit tests are unchanged.
 All **10 differential torture tests** passed after this adjustment (18 seconds).
+The production mixed-workload case also passed (8 seconds), and the full
+**50-test differential suite** passed with a two-minute per-test hang collector
+(34 seconds). Remote differential execution was still taking longer than the
+local run, so CI now collects a sequence/minidump if a test makes no progress
+for two minutes, uploads those diagnostics on failure, and limits the
+differential step to five minutes. Current-head remote CI remains a merge
+precondition; the local pass does not replace it.

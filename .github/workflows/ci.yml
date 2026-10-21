@@ -116,6 +116,7 @@ jobs:
           if ($failed) { exit 1 }
 
       - name: Test (DifferentialChecker)
+        timeout-minutes: 5
         shell: pwsh
         env:
           RAMDRIVE_DIFF: "1"
@@ -127,9 +128,21 @@ jobs:
           dotnet test tests/RamDrive.IntegrationTests/RamDrive.IntegrationTests.csproj `
             -c Release --no-build --verbosity normal `
             --filter "FullyQualifiedName!~ChaosTests" `
+            --blame-hang-timeout 2m --blame-hang-dump-type mini `
             --logger "trx;LogFileName=RamDrive.IntegrationTests.Diff.trx" `
             --results-directory ./TestResults
           if ($LASTEXITCODE -ne 0) { exit 1 }
+
+      - name: Upload differential hang diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: differential-hang-diagnostics
+          path: |
+            TestResults/**/*_Sequence.xml
+            TestResults/**/*.dmp
+          if-no-files-found: ignore
+          retention-days: 3
 
       - name: Test report
         uses: dorny/test-reporter@v2

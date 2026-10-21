@@ -25,3 +25,4 @@
 
 - [x] 5.1 Review Copilot's callback-ordering concern against pinned WinFsp/WinFsp.Native source and document the external contract, dispatcher shutdown and regression evidence in `tla/FILE_OBJECT_LIFETIME.md`.
 - [x] 5.2 Bound the 100-worker mixed workload within both backends' capacity semantics after CI exposed a DiskFull mismatch; keep strict differential comparison and separate capacity tests, and rerun all 10 differential torture cases.
+- [x] 5.3 Add a two-minute per-test differential hang diagnostic and a five-minute CI step limit with uploaded sequence/minidump artifacts; rerun the full 50-test differential suite locally.
