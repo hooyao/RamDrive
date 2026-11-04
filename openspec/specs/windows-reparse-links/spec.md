@@ -44,6 +44,14 @@ Link traversal SHALL use WinFsp and Windows reparse resolution, including nested
 - **WHEN** a link targets a different volume or UNC share
 - **THEN** Windows routes the request to that target and RamDrive does not interpret it as a local node
 
+#### Scenario: Target access checks
+- **WHEN** a target's access control denies a caller read access
+- **THEN** reading the target through a file symlink, directory symlink or junction is also denied
+
+#### Scenario: Target identity through links
+- **WHEN** a caller opens a target directly and through links
+- **THEN** the resulting handles report the same volume and file identity and observe the same contents
+
 ### Requirement: Reparse metadata remains coherent
 Namespace changes and reparse mutations SHALL be synchronized so that setting a link on a directory with children and creating a child beneath a link cannot both succeed. Link attributes, tag and data SHALL remain consistent under concurrent access and kernel metadata caching.
 

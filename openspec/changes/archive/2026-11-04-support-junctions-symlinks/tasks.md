@@ -31,3 +31,7 @@
 - [x] 5.1 Merge the WinFsp.Native change after Copilot review and Windows x64/ARM64 CI.
 - [x] 5.2 Configure trusted publishing and publish WinFsp.Native 0.1.3-pre.5 to NuGet.
 - [x] 5.3 Replace the temporary source snapshot with the published NuGet package and verify the build and integration tests.
+
+## 6. PR review follow-up
+
+- [x] 6.1 Verify target ACL enforcement and target identity/cache coherence with mounted integration tests.

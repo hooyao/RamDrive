@@ -2,6 +2,8 @@ using System.Buffers.Binary;
 using System.ComponentModel;
 using System.Runtime.InteropServices;
 using System.Runtime.Versioning;
+using System.Security.AccessControl;
+using System.Security.Principal;
 using FluentAssertions;
 using Microsoft.Win32.SafeHandles;
 
@@ -21,6 +23,18 @@ public sealed class ReparseLinkTests(RamDriveFixture fixture)
     [return: MarshalAs(UnmanagedType.Bool)]
     private static extern bool DeviceIoControl(SafeFileHandle handle, uint code, byte[]? input, int inputSize,
         byte[]? output, int outputSize, out int returned, nint overlapped);
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct ByHandleFileInformation
+    {
+        public uint FileAttributes;
+        public System.Runtime.InteropServices.ComTypes.FILETIME CreationTime, LastAccessTime, LastWriteTime;
+        public uint VolumeSerialNumber, FileSizeHigh, FileSizeLow, NumberOfLinks, FileIndexHigh, FileIndexLow;
+    }
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool GetFileInformationByHandle(SafeFileHandle handle, out ByHandleFileInformation information);
 
     private static SafeFileHandle LinkHandle(string path, uint access = 0xC0000000)
     {
@@ -71,6 +85,64 @@ public sealed class ReparseLinkTests(RamDriveFixture fixture)
         new DirectoryInfo(dirLink).LinkTarget.Should().Be("target");
         new FileInfo(fileLink).LinkTarget.Should().Be(@"target\data.txt");
         Control(dirLink, 0x000900A8).Ok.Should().BeTrue();
+    }
+
+    [Fact]
+    public void LinkTargets_EnforceTargetReadAccess()
+    {
+        string targetDir = Path.Combine(_root, "protected");
+        Directory.CreateDirectory(targetDir);
+        string target = Path.Combine(targetDir, "data");
+        File.WriteAllText(target, "private");
+        string fileLink = Path.Combine(_root, "file-link");
+        string dirLink = Path.Combine(_root, "dir-link");
+        string junction = Path.Combine(_root, "junction");
+        File.CreateSymbolicLink(fileLink, @"protected\data");
+        Directory.CreateSymbolicLink(dirLink, "protected");
+        Directory.CreateDirectory(junction);
+        Control(junction, 0x000900A4, JunctionData(@"\??\UNC\" + targetDir.TrimStart('\\'))).Ok.Should().BeTrue();
+
+        var info = new FileInfo(target);
+        FileSecurity security = info.GetAccessControl();
+        var everyone = new SecurityIdentifier(WellKnownSidType.WorldSid, null);
+        security.AddAccessRule(new FileSystemAccessRule(everyone, FileSystemRights.ReadData, AccessControlType.Deny));
+        info.SetAccessControl(security);
+
+        foreach (string path in new[] { target, fileLink, Path.Combine(dirLink, "data"), Path.Combine(junction, "data") })
+            Assert.Throws<UnauthorizedAccessException>(() => File.ReadAllText(path));
+        Control(fileLink, 0x000900A8).Ok.Should().BeTrue("the link itself remains accessible");
+    }
+
+    [Fact]
+    public void LinkTargets_ShareFileIdentityAndCachedData()
+    {
+        string targetDir = Path.Combine(_root, "target");
+        Directory.CreateDirectory(targetDir);
+        string target = Path.Combine(targetDir, "data");
+        File.WriteAllText(target, "before");
+        string fileLink = Path.Combine(_root, "file-link");
+        string dirLink = Path.Combine(_root, "dir-link");
+        File.CreateSymbolicLink(fileLink, @"target\data");
+        Directory.CreateSymbolicLink(dirLink, "target");
+
+        using var direct = File.OpenHandle(target, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+        using var throughFile = File.OpenHandle(fileLink, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+        using var throughDirectory = File.OpenHandle(Path.Combine(dirLink, "data"), FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+        GetFileInformationByHandle(direct, out var directInfo).Should().BeTrue();
+        GetFileInformationByHandle(throughFile, out var fileInfo).Should().BeTrue();
+        GetFileInformationByHandle(throughDirectory, out var dirInfo).Should().BeTrue();
+        directInfo.VolumeSerialNumber.Should().NotBe(0);
+        (directInfo.FileIndexHigh | directInfo.FileIndexLow).Should().NotBe(0);
+        (fileInfo.VolumeSerialNumber, fileInfo.FileIndexHigh, fileInfo.FileIndexLow)
+            .Should().Be((directInfo.VolumeSerialNumber, directInfo.FileIndexHigh, directInfo.FileIndexLow));
+        (dirInfo.VolumeSerialNumber, dirInfo.FileIndexHigh, dirInfo.FileIndexLow)
+            .Should().Be((directInfo.VolumeSerialNumber, directInfo.FileIndexHigh, directInfo.FileIndexLow));
+
+        File.WriteAllText(target, "a longer value");
+        File.ReadAllText(fileLink).Should().Be("a longer value");
+        File.WriteAllText(Path.Combine(dirLink, "data"), "changed via link");
+        File.ReadAllText(target).Should().Be("changed via link");
+        RandomAccess.GetLength(throughFile).Should().Be("changed via link".Length);
     }
 
     [Fact]
