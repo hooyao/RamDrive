@@ -545,6 +545,11 @@ public sealed class ReparseLinkTests(RamDriveFixture fixture)
                     Console.WriteLine($"Developer Mode: {devMode ?? "unset"}; NTFS: {expected.Ok}, {expected.Error}; RamDrive: {actual.Ok}, {actual.Error}");
                     Console.WriteLine($"NTFS delete: {expectedDelete.Ok}, {expectedDelete.Error}; RamDrive delete: {actualDelete.Ok}, {actualDelete.Error}");
                     Console.WriteLine($"NTFS CreateSymbolicLink: {expectedCreate}; RamDrive CreateSymbolicLink: {actualCreate}");
+                    if (Environment.GetEnvironmentVariable("RAMDRIVE_EXPECT_DEV_MODE_OFF") == "1")
+                    {
+                        devMode.Should().Be(0);
+                        expectedCreate.Should().Be(1314, "the restricted NTFS caller must not be allowed to create a symbolic link");
+                    }
                     actual.Ok.Should().Be(expected.Ok, $"NTFS error={expected.Error}, RamDrive error={actual.Error}");
                     if (!expected.Ok) actual.Error.Should().Be(expected.Error);
                     actualDelete.Ok.Should().Be(expectedDelete.Ok, $"NTFS error={expectedDelete.Error}, RamDrive error={actualDelete.Error}");

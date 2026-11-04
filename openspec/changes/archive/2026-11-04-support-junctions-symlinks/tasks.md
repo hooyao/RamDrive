@@ -37,3 +37,4 @@
 - [x] 6.1 Verify target ACL enforcement and target identity/cache coherence with mounted integration tests.
 - [x] 6.2 Independently verify the GitHub-built AOT executable on a real drive, including ACL enforcement and cache identity.
 - [ ] 6.3 Compare unprivileged symbolic-link mutation behavior with NTFS on GitHub's Windows runner and resolve the access-check review finding.
+- [ ] 6.4 Verify the comparison with Developer Mode disabled on a disposable Windows CI runner.
