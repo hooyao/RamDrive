@@ -29,6 +29,22 @@ public sealed class PagedFileContent : IDisposable
     }
 
     /// <summary>
+    /// Atomically perform a metadata change only while the logical file is empty.
+    /// The caller must not re-enter this content object from <paramref name="action"/>.
+    /// </summary>
+    internal bool TryWhenEmpty(Action action)
+    {
+        _lock.EnterWriteLock();
+        try
+        {
+            if (_length != 0) return false;
+            action();
+            return true;
+        }
+        finally { _lock.ExitWriteLock(); }
+    }
+
+    /// <summary>
     /// Actual bytes allocated (pages with data × page size).
     /// Sparse pages (nint.Zero) are not counted.
     /// </summary>

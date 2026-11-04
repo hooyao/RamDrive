@@ -116,6 +116,8 @@ public class DifferentialAdapterTests
 
         public int GetFileSecurityByName(string fileName, out uint fileAttributes, ref byte[]? sd)
             { fileAttributes = FileAttributes; return NtStatus.Success; }
+        public ValueTask<SecurityByNameResult> GetFileSecurityByName(string fileName, bool getSecurityDescriptor, CancellationToken ct)
+            => new(SecurityByNameResult.Success(FileAttributes));
 
         public ValueTask<CreateResult> CreateFile(string fileName, uint co, uint ga, uint fa,
             byte[]? sd, ulong alloc, FileOperationInfo info, CancellationToken ct)

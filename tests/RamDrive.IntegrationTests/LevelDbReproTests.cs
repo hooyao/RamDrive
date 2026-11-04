@@ -281,10 +281,11 @@ public class LevelDbDefaultTimeoutTests : IDisposable
             Microsoft.Extensions.Logging.Abstractions.NullLogger<RamDriveCore.FileSystem.WinFspRamAdapter>.Instance))
         {
             Prefix = $@"\winfsp-tests\itest-default-{Environment.ProcessId}",
+            PrefixOnly = true,
         };
         int r = _host.Mount(null);
         if (r < 0) throw new InvalidOperationException($"mount failed: 0x{r:X8}");
-        _root = (_host.MountPoint ?? throw new InvalidOperationException("no mount")) + @"\";
+        _root = @"\" + _host.Prefix + @"\";
         _dir = Path.Combine(_root, $"ldb_default_{Guid.NewGuid():N}");
     }
 

@@ -105,6 +105,7 @@ public sealed unsafe class WinFspRamAdapter : IFileSystem
         host.CasePreservedNames = true;
         host.UnicodeOnDisk = true;
         host.PersistentAcls = true;
+        host.ReparsePoints = true;
         host.PostCleanupWhenModifiedOnly = true;
         // Non-zero volume serial. std::filesystem::copy_file compares (VolumeSerialNumber, file id)
         // to detect "source and destination are the same file". A zero serial combined with a zero
@@ -158,6 +159,45 @@ public sealed unsafe class WinFspRamAdapter : IFileSystem
         securityDescriptor = node.SecurityDescriptor ?? FallbackSdFor(fileName);
         FsTracer.Trace("GetFileSecurityByName", fileName, $"attr=0x{fileAttributes:X}");
         return NtStatus.Success;
+    }
+
+    public int GetReparsePointByName(string fileName, bool isDirectory, out byte[]? reparseData)
+    {
+        int status = _fs.GetReparsePoint(fileName, null, out reparseData);
+        if (status == NtStatus.Success) reparseData = ReparseData.ForResolution(reparseData!, _host?.Prefix, _host?.MountPoint);
+        return status;
+    }
+
+    public int GetReparsePoint(string fileName, ref byte[]? reparseData, FileOperationInfo info)
+        => _fs.GetReparsePoint(null, Node(info), out reparseData);
+
+    public int SetReparsePoint(string fileName, byte[] reparseData, FileOperationInfo info)
+    {
+        var node = Node(info);
+        if (node == null) return NtStatus.ObjectNameNotFound;
+        int status = _fs.SetReparsePoint(node, reparseData);
+        if (status == NtStatus.Success)
+            Notify(FileNotify.ChangeAttributes, FileNotify.ActionModified, fileName);
+        return status;
+    }
+
+    public int DeleteReparsePoint(string fileName, byte[] reparseData, FileOperationInfo info)
+    {
+        var node = Node(info);
+        if (node == null) return NtStatus.ObjectNameNotFound;
+        int status = _fs.DeleteReparsePoint(node, reparseData);
+        if (status == NtStatus.Success)
+            Notify(FileNotify.ChangeAttributes, FileNotify.ActionModified, fileName);
+        return status;
+    }
+
+    public ValueTask<SecurityByNameResult> GetFileSecurityByName(string fileName, bool getSecurityDescriptor, CancellationToken ct)
+    {
+        byte[]? sd = null;
+        int status = GetFileSecurityByName(fileName, out uint attributes, ref sd);
+        return new(status == NtStatus.Success
+            ? SecurityByNameResult.Success(attributes, getSecurityDescriptor ? sd : null)
+            : SecurityByNameResult.Error(status));
     }
 
     // Defensive fallback for GetFileSecurityByName / GetFileSecurity. Should be unreachable
@@ -699,20 +739,25 @@ public sealed unsafe class WinFspRamAdapter : IFileSystem
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private static FspFileInfo MakeFileInfo(FileNode node) => new()
+    private static FspFileInfo MakeFileInfo(FileNode node)
     {
-        FileAttributes = (uint)node.Attributes,
-        FileSize = (ulong)node.Size,
-        AllocationSize = (ulong)node.AllocatedBytes, // actual pages, not logical size
-        CreationTime = ToFileTime(node.CreationTime),
-        LastAccessTime = ToFileTime(node.LastAccessTime),
-        LastWriteTime = ToFileTime(node.LastWriteTime),
-        ChangeTime = ToFileTime(node.LastWriteTime), // reuse LastWriteTime
-        // Unique file id. Without it every file reports id 0, and a same-volume
-        // std::filesystem::copy_file treats distinct files as identical (file_exists). See
-        // FileNode.IndexNumber and spec file-id-uniqueness.
-        IndexNumber = node.IndexNumber,
-    };
+        var metadata = node.GetReparseMetadata();
+        return new()
+        {
+            FileAttributes = (uint)metadata.Attributes,
+            ReparseTag = metadata.Tag,
+            FileSize = (ulong)node.Size,
+            AllocationSize = (ulong)node.AllocatedBytes, // actual pages, not logical size
+            CreationTime = ToFileTime(node.CreationTime),
+            LastAccessTime = ToFileTime(node.LastAccessTime),
+            LastWriteTime = ToFileTime(node.LastWriteTime),
+            ChangeTime = ToFileTime(node.LastWriteTime), // reuse LastWriteTime
+            // Unique file id. Without it every file reports id 0, and a same-volume
+            // std::filesystem::copy_file treats distinct files as identical (file_exists). See
+            // FileNode.IndexNumber and spec file-id-uniqueness.
+            IndexNumber = node.IndexNumber,
+        };
+    }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private static ulong ToFileTime(DateTime dt)

@@ -15,7 +15,22 @@ public sealed class FileNode : IDisposable
 {
     public string Name { get; set; }
     public FileNodeType NodeType { get; }
-    public FileAttributes Attributes { get; set; }
+    private int _attributes;
+    // ReparseData is an immutable buffer replaced only under RamFileSystem's structure lock.
+    internal byte[]? ReparseData;
+    public FileAttributes Attributes
+    {
+        get => GetReparseMetadata().Attributes;
+        set => Volatile.Write(ref _attributes, (int)(value & ~FileAttributes.ReparsePoint));
+    }
+
+    internal (FileAttributes Attributes, uint Tag) GetReparseMetadata()
+    {
+        byte[]? data = Volatile.Read(ref ReparseData);
+        var attributes = (FileAttributes)Volatile.Read(ref _attributes);
+        return data == null ? (attributes, 0) :
+            (attributes | FileAttributes.ReparsePoint, System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(data));
+    }
     public DateTime CreationTime { get; set; }
     public DateTime LastWriteTime { get; set; }
     public DateTime LastAccessTime { get; set; }

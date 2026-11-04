@@ -58,6 +58,9 @@ jobs:
       - name: Verify lifetime models and original-bug counterexample
         shell: pwsh
         run: ./tla/Verify-Lifetime.ps1 -Workers 4
+      - name: Verify reparse models and expected counterexamples
+        shell: pwsh
+        run: ./tla/Verify-Reparse.ps1 -Workers 4
       - name: Upload model-check logs
         if: always()
         uses: actions/upload-artifact@v4
@@ -66,6 +69,8 @@ jobs:
           path: |
             artifacts/tla-lifetime/*.log
             artifacts/tla-lifetime/results.json
+            artifacts/tla-reparse/*.log
+            artifacts/tla-reparse/results.json
           retention-days: 14
 
   build-and-test:
@@ -90,6 +95,11 @@ jobs:
             Write-Error "WinFsp installation failed - DLL not found"
             exit 1
           }
+
+      # Integration mounts use UNC shares. Permit Windows to follow test symlinks
+      # between those shares on this disposable runner.
+      - name: Enable remote symbolic link evaluation
+        run: fsutil behavior set SymlinkEvaluation R2R:1
 
       - name: Restore dependencies
         run: dotnet restore RamDrive.slnx
@@ -176,6 +186,55 @@ jobs:
             exit 1
           }
           Write-Host "ARM64 cross-publish OK: $((Get-Item ./publish-aot-arm64-ci/RamDrive.exe).Length) bytes"
+
+  symlink-privilege-parity:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "10.0.x"
+      - name: Install WinFsp
+        shell: pwsh
+        run: choco install winfsp -y --params '/Developer'
+      - name: Enable remote symbolic link evaluation
+        run: fsutil behavior set SymlinkEvaluation R2R:1
+      - name: Restore and build the integration tests
+        shell: pwsh
+        run: |
+          dotnet restore tests/RamDrive.IntegrationTests/RamDrive.IntegrationTests.csproj
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          dotnet build tests/RamDrive.IntegrationTests/RamDrive.IntegrationTests.csproj -c Release --no-restore
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Compare unprivileged link mutations with Developer Mode disabled
+        shell: pwsh
+        run: |
+          @'
+          ### Known symbolic-link privilege limitation
+          With Developer Mode disabled, RamDrive permits unprivileged symbolic-link creation where NTFS rejects it. The comparison test accepts this exact documented discrepancy while checking the other outcomes.
+          '@ | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
+          # This runs only on a disposable GitHub runner. Restore its original
+          # registry value even if the comparison test fails.
+          $key = [Microsoft.Win32.Registry]::LocalMachine.CreateSubKey('SOFTWARE\Microsoft\Windows\CurrentVersion\AppModelUnlock')
+          $name = 'AllowDevelopmentWithoutDevLicense'
+          $hadValue = $key.GetValueNames() -contains $name
+          if ($hadValue) { $original = $key.GetValue($name); $kind = $key.GetValueKind($name) }
+          $testExit = 1
+          try {
+            $key.SetValue($name, 0, [Microsoft.Win32.RegistryValueKind]::DWord)
+            $env:RAMDRIVE_EXPECT_DEV_MODE_OFF = '1'
+            dotnet test tests/RamDrive.IntegrationTests/RamDrive.IntegrationTests.csproj `
+              -c Release --no-build --no-restore `
+              --filter 'FullyQualifiedName~SymbolicLinkMutations_WithoutPrivileges_MatchNtfs' `
+              --logger 'console;verbosity=detailed'
+            $testExit = $LASTEXITCODE
+          } finally {
+            if ($hadValue) { $key.SetValue($name, $original, $kind) } else { $key.DeleteValue($name, $false) }
+            $key.Dispose()
+          }
+          if ($testExit -ne 0) { exit $testExit }
 
   installer:
     needs: changes

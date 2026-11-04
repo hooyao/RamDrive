@@ -18,6 +18,7 @@
 //   - MEMFS_NAME_NORMALIZATION (binding limitation)
 
 using System.Runtime.CompilerServices;
+using System.Buffers.Binary;
 using System.Runtime.InteropServices;
 using System.Runtime.Versioning;
 using System.Security.AccessControl;
@@ -130,6 +131,95 @@ public sealed unsafe class MemfsReferenceFs : IFileSystem
         }
         fileAttributes = n.FileAttributes;
         securityDescriptor = n.FileSecurity;
+        return NtStatus.Success;
+    }
+
+    public ValueTask<SecurityByNameResult> GetFileSecurityByName(string fileName, bool getSecurityDescriptor, CancellationToken ct)
+    {
+        byte[]? sd = null;
+        int status = GetFileSecurityByName(fileName, out uint attributes, ref sd);
+        return new(status == NtStatus.Success
+            ? SecurityByNameResult.Success(attributes, getSecurityDescriptor ? sd : null)
+            : SecurityByNameResult.Error(status));
+    }
+
+    public int GetReparsePointByName(string fileName, bool isDirectory, out byte[]? data)
+    {
+        lock (_mapLock)
+        {
+            _nodes.TryGetValue(fileName, out var node);
+            data = node?.ReparseData;
+            return node == null ? NtStatus.ObjectNameNotFound : data == null ? NtStatus.NotAReparse : NtStatus.Success;
+        }
+    }
+
+    public int GetReparsePoint(string fileName, ref byte[]? data, FileOperationInfo info)
+    {
+        lock (_mapLock)
+        {
+            var node = N(info);
+            data = node?.ReparseData;
+            return node == null ? NtStatus.ObjectNameNotFound : data == null ? NtStatus.NotAReparse : NtStatus.Success;
+        }
+    }
+
+    public int SetReparsePoint(string fileName, byte[] data, FileOperationInfo info)
+    {
+        var node = N(info);
+        if (node == null) return NtStatus.ObjectNameNotFound;
+        int status = ValidateReparseData(data, (node.FileAttributes & 0x10) != 0, false);
+        if (status != 0) return status;
+        lock (_mapLock)
+        {
+            if (HasChild(node)) return NtStatus.DirectoryNotEmpty;
+            uint tag = BinaryPrimitives.ReadUInt32LittleEndian(data);
+            if (node.ReparseData != null && node.ReparseTag != tag) return unchecked((int)0xC0000277);
+            if (node.FileSize != 0) return unchecked((int)0xC0000278);
+            node.ReparseData = (byte[])data.Clone();
+            node.ReparseTag = tag;
+            node.FileAttributes |= (uint)FileAttributes.ReparsePoint;
+            return NtStatus.Success;
+        }
+    }
+
+    public int DeleteReparsePoint(string fileName, byte[] data, FileOperationInfo info)
+    {
+        var node = N(info);
+        if (node == null) return NtStatus.ObjectNameNotFound;
+        int status = ValidateReparseData(data, (node.FileAttributes & 0x10) != 0, true);
+        if (status != 0) return status;
+        lock (_mapLock)
+        {
+            if (node.ReparseData == null) return NtStatus.NotAReparse;
+            if (node.ReparseTag != BinaryPrimitives.ReadUInt32LittleEndian(data)) return unchecked((int)0xC0000277);
+            node.ReparseData = null;
+            node.ReparseTag = 0;
+            node.FileAttributes &= ~(uint)FileAttributes.ReparsePoint;
+            return NtStatus.Success;
+        }
+    }
+
+    private static int ValidateReparseData(byte[] data, bool isDirectory, bool deleting)
+    {
+        const int invalidData = unchecked((int)0xC0000278), invalidTag = unchecked((int)0xC0000276);
+        if (data.Length < 8 || data.Length > 16384 || BinaryPrimitives.ReadUInt16LittleEndian(data.AsSpan(4)) != data.Length - 8 ||
+            (deleting && data.Length != 8)) return invalidData;
+        uint tag = BinaryPrimitives.ReadUInt32LittleEndian(data);
+        if (tag != 0xA0000003 && tag != 0xA000000C) return invalidTag;
+        if (deleting) return NtStatus.Success;
+        if (tag == 0xA0000003 && !isDirectory) return NtStatus.InvalidParameter;
+        int start = tag == 0xA0000003 ? 16 : 20;
+        if (data.Length < start) return invalidData;
+        if (start == 20 && (BinaryPrimitives.ReadUInt32LittleEndian(data.AsSpan(16)) & ~1u) != 0) return invalidData;
+        int a = BinaryPrimitives.ReadUInt16LittleEndian(data.AsSpan(8));
+        int b = BinaryPrimitives.ReadUInt16LittleEndian(data.AsSpan(10));
+        int c = BinaryPrimitives.ReadUInt16LittleEndian(data.AsSpan(12));
+        int d = BinaryPrimitives.ReadUInt16LittleEndian(data.AsSpan(14));
+        if (b == 0 || ((a | b | c | d) & 1) != 0 || a + b > data.Length - start || c + d > data.Length - start)
+            return invalidData;
+        if (tag == 0xA0000003 && b > 16384 - 20 &&
+            System.Text.Encoding.Unicode.GetString(data.AsSpan(start + a, b))
+                .StartsWith(@"\??\UNC\", StringComparison.OrdinalIgnoreCase)) return invalidData;
         return NtStatus.Success;
     }
 
@@ -314,7 +404,8 @@ public sealed unsafe class MemfsReferenceFs : IFileSystem
     {
         var n = N(info);
         if (n == null) return new(FsResult.Error(NtStatus.ObjectNameNotFound));
-        if (fileAttributes != unchecked((uint)-1)) n.FileAttributes = fileAttributes;
+        if (fileAttributes != unchecked((uint)-1))
+            n.FileAttributes = (fileAttributes & ~(uint)FileAttributes.ReparsePoint) | (n.FileAttributes & (uint)FileAttributes.ReparsePoint);
         if (creationTime    != 0) n.CreationTime    = creationTime;
         if (lastAccessTime  != 0) n.LastAccessTime  = lastAccessTime;
         if (lastWriteTime   != 0) n.LastWriteTime   = lastWriteTime;
@@ -548,6 +639,12 @@ public sealed unsafe class MemfsReferenceFs : IFileSystem
         dirInfo.FileInfo = MkInfo(n);
         dirInfo.SetFileName(LeafOf(n.FileName));
         return NtStatus.Success;
+    }
+
+    public ValueTask<DirInfoByNameResult> GetDirInfoByName(string dirName, string entryName, FileOperationInfo info, CancellationToken ct)
+    {
+        int status = GetDirInfoByName(dirName, entryName, out var dirInfo, info);
+        return new(status == NtStatus.Success ? DirInfoByNameResult.Success(dirInfo) : DirInfoByNameResult.Error(status));
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]

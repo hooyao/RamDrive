@@ -38,6 +38,24 @@ PagePool (NativeMemory + ConcurrentStack<nint>)
 - **Write-lock minimization** -- pages pre-allocated outside the lock, only memcpy inside
 - **Native AOT compiled** -- single-file executable, no .NET runtime required
 
+## Junctions and symbolic links
+
+RamDrive supports directory junctions and file and directory symbolic links, including relative
+targets and targets on other volumes. Windows resolves the links and applies symbolic-link
+evaluation policies. Links and their contents are lost when the RAM disk is
+unmounted. Other reparse-point types, such as cloud placeholders, are not supported.
+
+**Known limitation:** When Windows Developer Mode is disabled, a user with write access can
+create symbolic links on RamDrive without `SeCreateSymbolicLinkPrivilege`; NTFS rejects such
+creation. Do not rely on that privilege to prevent symbolic-link creation on shared RamDrive
+volumes. WinFsp 2.1 cannot enforce this check while preserving NTFS-compatible link deletion.
+
+RamDrive uses the `WinFsp.Native` NuGet package, with its version centrally managed in
+`Directory.Packages.props`.
+
+The UNC-mounted link integration tests require permission to create symbolic links and Windows'
+remote-to-remote symbolic-link evaluation policy to be enabled.
+
 ## Quick Start
 
 **Option A: Installer (recommended)**
@@ -75,6 +93,8 @@ Edit `appsettings.jsonc` or override via command line (`--RamDrive:CapacityMb=40
 ## Formal Verification
 
 The core concurrency protocol is formally verified with [TLA+](https://lamport.azurewebsted.net/tla/tla.html) and the TLC model checker.
+Bounded models for link mutations and resolution, including negative controls and their limitations,
+are documented in [tla/REPARSE_LINKS.md](tla/REPARSE_LINKS.md).
 
 **What's verified (`tla/RamDiskSystem.tla`):**
 
@@ -88,7 +108,7 @@ The core concurrency protocol is formally verified with [TLA+](https://lamport.a
 | DeadFilesClean | Deleted files hold no pages |
 | WriteTerminates | Every write eventually completes or fails (liveness) |
 
-**Verified configurations:**
+**Historical results for earlier model revisions** (current state counts may differ):
 
 | Config | Pages | Files | Distinct States | Result |
 |--------|-------|-------|----------------|--------|

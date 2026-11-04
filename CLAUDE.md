@@ -87,7 +87,7 @@ The WinFsp binding is provided by the [`WinFsp.Native`](https://www.nuget.org/pa
 - `ReadDirectory` uses native buffer with `WinFspFileSystem.AddDirInfo` / `EndDirInfo` — no IEnumerable allocation.
 - `SetMountPointEx` crashes on `"R:\"` (trailing backslash). Mount point format: `"R:"` = `DefineDosDevice` (invisible to disk tools), `"\\.\R:"` = Mount Manager (visible to all apps, requires admin or `MountUseMountmgrFromFSD=1` registry key). `WinFspHostedService` tries `\\.\R:` first, falls back to `R:` on failure.
 - **STATUS_PENDING async**: Must build a fresh stack-allocated `FspTransactRsp` with `Size`/`Kind`/`Hint` fields. Do NOT reuse `OperationContext->Response` — it may be invalidated after returning `STATUS_PENDING`. Save `Request->Hint` before returning, echo it back in the response.
-- **Test mounts must use UNC paths** (`host.Prefix = @"\winfsp-tests\name"`; `host.Mount(null)`), not drive letters. Drive letter mounts become zombie on process crash and hang Explorer/entire system.
+- **Test mounts must use UNC paths** (`host.Prefix = @"\winfsp-tests\name"`; `host.PrefixOnly = true`; `host.Mount(null)`), not drive letters. Without `PrefixOnly`, WinFsp treats a null mount point as an auto-assigned drive letter, which can become a zombie on process crash.
 - Detailed WinFsp binding design documented in the [`winfsp-native`](https://github.com/hooyao/winfsp-native) repository.
 
 ## Testing
@@ -126,6 +126,10 @@ dotnet run --project tests/RamDrive.Benchmarks -c Release -- e2e      # end-to-e
 ## Formal Verification (`tla/`)
 
 TLA+ models verified with [TLC model checker](https://github.com/tlaplus/tlaplus). Requires Java 11+.
+
+Reparse-point mutations and resolution have dedicated bounded models. Run
+`./tla/Verify-Reparse.ps1 -Workers 4`; see `tla/REPARSE_LINKS.md` for lock mapping,
+fairness assumptions, negative controls and model boundaries.
 
 ### Downloading TLC
 
