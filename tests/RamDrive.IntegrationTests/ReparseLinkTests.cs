@@ -5,6 +5,7 @@ using System.Runtime.Versioning;
 using System.Security.AccessControl;
 using System.Security.Principal;
 using FluentAssertions;
+using Microsoft.Win32;
 using Microsoft.Win32.SafeHandles;
 
 namespace RamDrive.IntegrationTests;
@@ -35,6 +36,42 @@ public sealed class ReparseLinkTests(RamDriveFixture fixture)
     [DllImport("kernel32.dll", SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]
     private static extern bool GetFileInformationByHandle(SafeFileHandle handle, out ByHandleFileInformation information);
+
+    [DllImport("kernel32.dll")]
+    private static extern nint GetCurrentProcess();
+
+    [DllImport("kernel32.dll")]
+    private static extern nint GetCurrentThread();
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct Luid { public uint Low; public int High; }
+    [StructLayout(LayoutKind.Sequential)]
+    private struct LuidAndAttributes { public Luid Luid; public uint Attributes; }
+    [StructLayout(LayoutKind.Sequential)]
+    private struct PrivilegeSet { public uint Count; public uint Control; public LuidAndAttributes Privilege; }
+
+    [DllImport("advapi32.dll", EntryPoint = "LookupPrivilegeValueW", CharSet = CharSet.Unicode, SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool LookupPrivilegeValue(string? system, string name, out Luid luid);
+
+    [DllImport("advapi32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool OpenThreadToken(nint thread, uint access, bool openAsSelf, out SafeAccessTokenHandle token);
+
+    [DllImport("advapi32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool PrivilegeCheck(SafeAccessTokenHandle token, ref PrivilegeSet privileges,
+        [MarshalAs(UnmanagedType.Bool)] out bool result);
+
+    [DllImport("advapi32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool OpenProcessToken(nint process, uint access, out SafeAccessTokenHandle token);
+
+    [DllImport("advapi32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool CreateRestrictedToken(SafeAccessTokenHandle existing, uint flags,
+        uint disabledSidCount, nint disabledSids, uint deletedPrivilegeCount, nint deletedPrivileges,
+        uint restrictedSidCount, nint restrictedSids, out SafeAccessTokenHandle token);
 
     private static SafeFileHandle LinkHandle(string path, uint access = 0xC0000000)
     {
@@ -450,5 +487,72 @@ public sealed class ReparseLinkTests(RamDriveFixture fixture)
             if (!expected.Ok) actual.Error.Should().Be(expected.Error);
         }
         finally { File.Delete(ntfsFile); File.Delete(ntfsEmpty); }
+    }
+
+    [Fact]
+    public void SymbolicLinkMutations_WithoutPrivileges_MatchNtfs()
+    {
+        string source = Path.Combine(_root, "source-link");
+        File.CreateSymbolicLink(source, "missing-target");
+        byte[] data = Control(source, 0x000900A8).Data;
+        string ramFile = Path.Combine(_root, "empty-file");
+        File.WriteAllText(ramFile, "");
+        string ntfsFile = Path.Combine(Path.GetTempPath(), "ramdrive-reparse-privilege-" + Guid.NewGuid().ToString("N"));
+        File.WriteAllText(ntfsFile, "");
+        string ntfsLink = ntfsFile + "-link";
+        string ramLink = Path.Combine(_root, "delete-link");
+        string ntfsCreated = ntfsFile + "-created";
+        string ramCreated = Path.Combine(_root, "created-link");
+        try
+        {
+            File.CreateSymbolicLink(ntfsLink, "missing-target");
+            File.CreateSymbolicLink(ramLink, "missing-target");
+            // Restrict only a duplicated token. The caller's process token and the
+            // machine's Developer Mode configuration are never changed.
+            OpenProcessToken(GetCurrentProcess(), 0x000E, out var processToken).Should().BeTrue();
+            using (processToken)
+            {
+                CreateRestrictedToken(processToken, 0x1, 0, 0, 0, 0, 0, 0, out var restrictedToken).Should().BeTrue();
+                using (restrictedToken)
+                {
+                    var expected = (Ok: false, Error: -1, Data: Array.Empty<byte>());
+                    var actual = (Ok: false, Error: -1, Data: Array.Empty<byte>());
+                    var expectedDelete = (Ok: false, Error: -1, Data: Array.Empty<byte>());
+                    var actualDelete = (Ok: false, Error: -1, Data: Array.Empty<byte>());
+                    int expectedCreate = -1, actualCreate = -1;
+                    WindowsIdentity.RunImpersonated(restrictedToken, () =>
+                    {
+                        LookupPrivilegeValue(null, "SeCreateSymbolicLinkPrivilege", out var luid).Should().BeTrue();
+                        var privileges = new PrivilegeSet { Count = 1, Control = 1, Privilege = new LuidAndAttributes { Luid = luid } };
+                        OpenThreadToken(GetCurrentThread(), 8, true, out var threadToken).Should().BeTrue();
+                        using (threadToken)
+                        {
+                            PrivilegeCheck(threadToken, ref privileges, out bool hasPrivilege).Should().BeTrue();
+                            hasPrivilege.Should().BeFalse();
+                        }
+                        expected = Control(ntfsFile, 0x000900A4, data);
+                        actual = Control(ramFile, 0x000900A4, data);
+                        byte[] delete = new byte[8];
+                        BinaryPrimitives.WriteUInt32LittleEndian(delete, 0xA000000C);
+                        expectedDelete = Control(ntfsLink, 0x000900AC, delete);
+                        actualDelete = Control(ramLink, 0x000900AC, delete);
+                        try { File.CreateSymbolicLink(ntfsCreated, "missing-target"); expectedCreate = 0; }
+                        catch (Exception ex) { expectedCreate = ex.HResult & 0xFFFF; }
+                        try { File.CreateSymbolicLink(ramCreated, "missing-target"); actualCreate = 0; }
+                        catch (Exception ex) { actualCreate = ex.HResult & 0xFFFF; }
+                    });
+                    object? devMode = Registry.GetValue(@"HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows\CurrentVersion\AppModelUnlock", "AllowDevelopmentWithoutDevLicense", null);
+                    Console.WriteLine($"Developer Mode: {devMode ?? "unset"}; NTFS: {expected.Ok}, {expected.Error}; RamDrive: {actual.Ok}, {actual.Error}");
+                    Console.WriteLine($"NTFS delete: {expectedDelete.Ok}, {expectedDelete.Error}; RamDrive delete: {actualDelete.Ok}, {actualDelete.Error}");
+                    Console.WriteLine($"NTFS CreateSymbolicLink: {expectedCreate}; RamDrive CreateSymbolicLink: {actualCreate}");
+                    actual.Ok.Should().Be(expected.Ok, $"NTFS error={expected.Error}, RamDrive error={actual.Error}");
+                    if (!expected.Ok) actual.Error.Should().Be(expected.Error);
+                    actualDelete.Ok.Should().Be(expectedDelete.Ok, $"NTFS error={expectedDelete.Error}, RamDrive error={actualDelete.Error}");
+                    if (!expectedDelete.Ok) actualDelete.Error.Should().Be(expectedDelete.Error);
+                    actualCreate.Should().Be(expectedCreate);
+                }
+            }
+        }
+        finally { File.Delete(ntfsFile); File.Delete(ntfsLink); File.Delete(ntfsCreated); }
     }
 }
