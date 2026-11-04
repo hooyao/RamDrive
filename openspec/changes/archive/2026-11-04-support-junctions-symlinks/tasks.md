@@ -35,3 +35,4 @@
 ## 6. PR review follow-up
 
 - [x] 6.1 Verify target ACL enforcement and target identity/cache coherence with mounted integration tests.
+- [x] 6.2 Independently verify the GitHub-built AOT executable on a real drive, including ACL enforcement and cache identity.
