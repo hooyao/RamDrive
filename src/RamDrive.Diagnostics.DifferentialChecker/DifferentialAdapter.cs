@@ -96,18 +96,33 @@ public sealed class DifferentialAdapter : IFileSystem
         return sa;
     }
 
-    public int GetFileSecurityByName(string fileName, out uint fileAttributes, ref byte[]? securityDescriptor)
+    public async ValueTask<SecurityByNameResult> GetFileSecurityByName(string fileName, bool getSecurityDescriptor, CancellationToken ct)
     {
-        byte[]? sdA = securityDescriptor, sdB = securityDescriptor;
-        int sa = _ram.GetFileSecurityByName(fileName, out var attrA, ref sdA);
-        int sb = _reference.GetFileSecurityByName(fileName, out var attrB, ref sdB);
-        Comparators.CompareStatus("GetFileSecurityByName", fileName, sa, sb);
-        if (sa >= 0 && attrA != attrB)
+        var a = await _ram.GetFileSecurityByName(fileName, getSecurityDescriptor, ct);
+        var b = await _reference.GetFileSecurityByName(fileName, getSecurityDescriptor, ct);
+        // The native host scans a missing path for an intermediate link after this
+        // callback returns. The two trees can classify the missing suffix differently;
+        // neither lookup has yet performed that shared native reparse step.
+        if (a.Status != b.Status && IsMissing(a.Status) && IsMissing(b.Status) && HasIntermediateReparse(fileName))
+            return a;
+        Comparators.CompareStatus("GetFileSecurityByName", fileName, a.Status, b.Status);
+        if (a.Status >= 0 && a.FileAttributes != b.FileAttributes)
             throw new DifferentialMismatchException(
-                $"DIFF in GetFileSecurityByName({fileName}): FileAttributes ram=0x{attrA:X} ref=0x{attrB:X}");
-        fileAttributes = attrA;
-        securityDescriptor = sdA;
-        return sa;
+                $"DIFF in GetFileSecurityByName({fileName}): FileAttributes ram=0x{a.FileAttributes:X} ref=0x{b.FileAttributes:X}");
+        return a;
+    }
+
+    public int GetReparsePointByName(string fileName, bool isDirectory, out byte[]? reparseData)
+        => _ram.GetReparsePointByName(fileName, isDirectory, out reparseData);
+
+    private static bool IsMissing(int status) => status == NtStatus.ObjectNameNotFound || status == NtStatus.ObjectPathNotFound;
+
+    private bool HasIntermediateReparse(string fileName)
+    {
+        for (int i = 1; i < fileName.Length; i++)
+            if (fileName[i] == '\\' && _ram.GetReparsePointByName(fileName[..i], true, out _) == NtStatus.Success)
+                return true;
+        return false;
     }
 
     public async ValueTask<CreateResult> CreateFile(string fileName, uint createOptions, uint grantedAccess,
@@ -374,6 +389,8 @@ public sealed class DifferentialAdapter : IFileSystem
         pair.RefCtx = info.Context;
         info.Context = pair;
         Comparators.CompareStatus("GetReparsePoint", fileName, sa, sb);
+        if (sa == NtStatus.Success && (rdA == null || rdB == null || !rdA.AsSpan().SequenceEqual(rdB)))
+            throw new DifferentialMismatchException($"DIFF in GetReparsePoint({fileName}): data differs");
         reparseData = rdA;
         return sa;
     }
@@ -458,21 +475,20 @@ public sealed class DifferentialAdapter : IFileSystem
         return sa;
     }
 
-    public int GetDirInfoByName(string dirName, string entryName, out FspDirInfo dirInfo, FileOperationInfo info)
+    public async ValueTask<DirInfoByNameResult> GetDirInfoByName(string dirName, string entryName, FileOperationInfo info, CancellationToken ct)
     {
         var pair = P(info);
         SwapTo(info, pair.RamCtx);
-        int sa = _ram.GetDirInfoByName(dirName, entryName, out var dA, info);
+        var a = await _ram.GetDirInfoByName(dirName, entryName, info, ct);
         pair.RamCtx = info.Context;
         SwapTo(info, pair.RefCtx);
-        int sb = _reference.GetDirInfoByName(dirName, entryName, out var dB, info);
+        var b = await _reference.GetDirInfoByName(dirName, entryName, info, ct);
         pair.RefCtx = info.Context;
         info.Context = pair;
-        Comparators.CompareStatus("GetDirInfoByName", entryName, sa, sb);
-        if (sa >= 0)
-            Comparators.CompareFileInfo("GetDirInfoByName", entryName, dA.FileInfo, dB.FileInfo);
-        dirInfo = dA;
-        return sa;
+        Comparators.CompareStatus("GetDirInfoByName", entryName, a.Status, b.Status);
+        if (a.Status >= 0)
+            Comparators.CompareFileInfo("GetDirInfoByName", entryName, a.DirInfo.FileInfo, b.DirInfo.FileInfo);
+        return a;
     }
 
     public int ExceptionHandler(Exception ex)

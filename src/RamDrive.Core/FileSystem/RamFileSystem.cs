@@ -1,4 +1,5 @@
 using RamDrive.Core.Memory;
+using WinFsp.Native;
 
 namespace RamDrive.Core.FileSystem;
 
@@ -57,6 +58,59 @@ public sealed class RamFileSystem : IDisposable
             var node = FindNodeInternal(path);
             if (node != null) node.OpenReferences++;
             return node;
+        }
+    }
+
+    /// <summary>Returns an immutable reparse buffer from the namespace or a retained handle.</summary>
+    public int GetReparsePoint(string? path, FileNode? node, out byte[]? data)
+    {
+        lock (_structureLock)
+        {
+            node ??= path == null ? null : FindNodeInternal(path);
+            byte[]? stored = node?.ReparseData;
+            data = stored == null ? null : (byte[])stored.Clone();
+            return node == null ? NtStatus.ObjectNameNotFound : data == null ? NtStatus.NotAReparse : NtStatus.Success;
+        }
+    }
+
+    public int SetReparsePoint(FileNode node, byte[] data)
+    {
+        if (data.Length < 8 || data.Length > 16 * 1024) return ReparseData.InvalidData;
+        // Validate the same immutable snapshot that will be published, even if a
+        // caller changes its input buffer while the operation is in progress.
+        byte[] copy = (byte[])data.Clone();
+        int validation = ReparseData.ValidateSet(copy, node.IsDirectory);
+        if (validation != NtStatus.Success) return validation;
+        lock (_structureLock)
+        {
+            if (node.IsDirectory && node.Children!.Count != 0) return NtStatus.DirectoryNotEmpty;
+            if (node.ReparseData is { } existing && ReparseData.Tag(existing) != ReparseData.Tag(copy))
+                return ReparseData.TagMismatch;
+            // Lock order is structure -> content, also used by unlink/disposal.
+            // Hold the content lock from the empty check through publication so a
+            // concurrent write cannot make a non-empty file into a link.
+            if (node.Content != null)
+            {
+                if (!node.Content.TryWhenEmpty(() => Volatile.Write(ref node.ReparseData, copy)))
+                    return ReparseData.InvalidData;
+            }
+            else Volatile.Write(ref node.ReparseData, copy);
+            return NtStatus.Success;
+        }
+    }
+
+    public int DeleteReparsePoint(FileNode node, byte[] data)
+    {
+        if (data.Length != 8) return ReparseData.InvalidData;
+        byte[] request = (byte[])data.Clone();
+        int validation = ReparseData.ValidateDelete(request);
+        if (validation != NtStatus.Success) return validation;
+        lock (_structureLock)
+        {
+            if (node.ReparseData is not { } existing) return NtStatus.NotAReparse;
+            if (ReparseData.Tag(existing) != ReparseData.Tag(request)) return ReparseData.TagMismatch;
+            Volatile.Write(ref node.ReparseData, null);
+            return NtStatus.Success;
         }
     }
 
@@ -269,11 +323,11 @@ public sealed class RamFileSystem : IDisposable
         FileNode current = _root;
         for (int i = 0; i < parts.Length - 1; i++)
         {
-            if (!current.IsDirectory) return (null, null);
+            if (!current.IsDirectory || current.ReparseData != null) return (null, null);
             if (!current.Children!.TryGetValue(parts[i], out var child)) return (null, null);
             current = child;
         }
 
-        return (current, parts[^1]);
+        return current.ReparseData == null ? (current, parts[^1]) : (null, null);
     }
 }

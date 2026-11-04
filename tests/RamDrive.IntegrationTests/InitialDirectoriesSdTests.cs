@@ -75,12 +75,13 @@ public sealed class InitialDirectoriesSdFixture : IDisposable
 
         _host = new FileSystemHost(adapter);
         _host.Prefix = $@"\winfsp-tests\initdir-sd-{Environment.ProcessId}-{Guid.NewGuid():N}";
+        _host.PrefixOnly = true;
 
         int result = _host.Mount(null);
         if (result < 0)
             throw new InvalidOperationException($"WinFsp mount failed: 0x{result:X8}. Is WinFsp installed?");
 
-        Root = _host.MountPoint!;
+        Root = @"\" + _host.Prefix;
         if (!Root.EndsWith('\\')) Root += @"\";
     }
 

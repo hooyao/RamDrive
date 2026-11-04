@@ -79,6 +79,7 @@ public sealed class RamDriveFixture : IDisposable
         _host = new FileSystemHost(adapter);
         string share = $"itest-{Environment.ProcessId}-{++_generation}";
         _host.Prefix = $@"\winfsp-tests\{share}";
+        _host.PrefixOnly = true;
 
         int result = _host.Mount(null);
         if (result < 0)

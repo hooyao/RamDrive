@@ -58,6 +58,9 @@ jobs:
       - name: Verify lifetime models and original-bug counterexample
         shell: pwsh
         run: ./tla/Verify-Lifetime.ps1 -Workers 4
+      - name: Verify reparse models and expected counterexamples
+        shell: pwsh
+        run: ./tla/Verify-Reparse.ps1 -Workers 4
       - name: Upload model-check logs
         if: always()
         uses: actions/upload-artifact@v4
@@ -66,6 +69,8 @@ jobs:
           path: |
             artifacts/tla-lifetime/*.log
             artifacts/tla-lifetime/results.json
+            artifacts/tla-reparse/*.log
+            artifacts/tla-reparse/results.json
           retention-days: 14
 
   build-and-test:
@@ -90,6 +95,11 @@ jobs:
             Write-Error "WinFsp installation failed - DLL not found"
             exit 1
           }
+
+      # Integration mounts use UNC shares. Permit Windows to follow test symlinks
+      # between those shares on this disposable runner.
+      - name: Enable remote symbolic link evaluation
+        run: fsutil behavior set SymlinkEvaluation R2R:1
 
       - name: Restore dependencies
         run: dotnet restore RamDrive.slnx

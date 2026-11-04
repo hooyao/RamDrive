@@ -57,6 +57,8 @@ public class IFileSystemContractTests
             { totalSize = 0; freeSize = 0; volumeLabel = ""; return NtStatus.Success; }
         public int GetFileSecurityByName(string fileName, out uint fileAttributes, ref byte[]? securityDescriptor)
             { fileAttributes = 0; return NtStatus.ObjectNameNotFound; }
+        public ValueTask<SecurityByNameResult> GetFileSecurityByName(string fileName, bool getSecurityDescriptor, CancellationToken ct)
+            => new(SecurityByNameResult.Error(NtStatus.ObjectNameNotFound));
         public ValueTask<CreateResult> CreateFile(string fileName, uint createOptions, uint grantedAccess,
             uint fileAttributes, byte[]? securityDescriptor, ulong allocationSize, FileOperationInfo info, CancellationToken ct)
             => new(CreateResult.Error(NtStatus.InvalidDeviceRequest));

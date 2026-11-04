@@ -102,6 +102,13 @@ public unsafe class OnReadWriteBenchmark
             return NtStatus.Success;
         }
 
+        public ValueTask<SecurityByNameResult> GetFileSecurityByName(string fileName, bool getSecurityDescriptor, CancellationToken ct)
+        {
+            byte[]? sd = null;
+            int status = GetFileSecurityByName(fileName, out uint attrs, ref sd);
+            return new(status == NtStatus.Success ? SecurityByNameResult.Success(attrs, getSecurityDescriptor ? sd : null) : SecurityByNameResult.Error(status));
+        }
+
         public ValueTask<CreateResult> CreateFile(string fileName, uint co, uint ga, uint fa, byte[]? sd, ulong alloc,
             FileOperationInfo info, CancellationToken ct)
         {

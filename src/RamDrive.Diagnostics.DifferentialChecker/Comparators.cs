@@ -21,12 +21,13 @@ internal static class Comparators
     //     pre-allocates a byte[] for the whole logical size. Both are valid AllocationSize
     //     reports per WinFsp semantics; cache coherency only depends on FileSize.
     //   - IndexNumber: per-instance index counter, never matches.
-    //   - ReparseTag: not relevant unless the test exercises reparse points (none do).
     //   - HardLinks / EaSize: not modelled.
     public static void CompareFileInfo(string method, string? path, in FspFileInfo a, in FspFileInfo b)
     {
         if (a.FileAttributes != b.FileAttributes)
             throw New(method, path, $"FileAttributes ram=0x{a.FileAttributes:X} ref=0x{b.FileAttributes:X}");
+        if (a.ReparseTag != b.ReparseTag)
+            throw New(method, path, $"ReparseTag ram=0x{a.ReparseTag:X} ref=0x{b.ReparseTag:X}");
         if (a.FileSize != b.FileSize)
             throw New(method, path, $"FileSize ram={a.FileSize} ref={b.FileSize}");
     }
