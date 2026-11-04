@@ -33,12 +33,17 @@ public sealed class RamDriveFixture : IDisposable
     private int _generation;
     private bool _disposed;
 
-    public RamDriveFixture() => Mount();
+    public RamDriveFixture()
+    {
+        Mount();
+    }
 
     /// <summary>
-    /// Each serialized test starts with its own volume. Clean kernel cache references
-    /// can retain deleted backing objects until Close; they must not consume the next
-    /// test's capacity or require premature disposal to make the suite pass.
+    /// Each serialized test starts with its own volume. The driver defers a node's
+    /// Close until every reference — handles AND Cc sections / memory mappings — is
+    /// gone, so clean kernel cache references can retain deleted backing objects until
+    /// their last handle's Close; they must not consume the next test's capacity or
+    /// require premature disposal to make the suite pass.
     /// </summary>
     public RamDriveFixture ResetForTest()
     {

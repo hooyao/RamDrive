@@ -16,7 +16,8 @@ namespace RamDrive.Core.FileSystem;
 ///
 /// Design: zero managed heap allocation on hot path (Read/Write/GetFileInfo etc).
 /// All ValueTask returns are synchronous-completed (no Task boxing).
-/// FileNode is cached in <see cref="FileOperationInfo.Context"/>.
+/// The per-handle <see cref="FileHandleContext"/> (wrapping the FileNode) is cached in
+/// <see cref="FileOperationInfo.Context"/>.
 ///
 /// <para>
 /// <b>Cache-invalidation matrix</b> — every path-mutating callback below sends an
@@ -156,8 +157,14 @@ public sealed unsafe class WinFspRamAdapter : IFileSystem
             return NtStatus.ObjectNameNotFound;
         }
 
-        fileAttributes = (uint)node.Attributes;
-        securityDescriptor = node.SecurityDescriptor ?? FallbackSdFor(fileName);
+        // A named stream reports its BASE's security descriptor and attributes (NTFS: one
+        // security descriptor per file, shared by all of its streams). The Directory bit
+        // never propagates to a stream (its base may be a directory or the volume root).
+        var meta = node.MetadataOwner;
+        fileAttributes = (uint)(node.BaseNode == null
+            ? meta.Attributes
+            : meta.Attributes & ~FileAttributes.Directory);
+        securityDescriptor = meta.SecurityDescriptor ?? FallbackSdFor(fileName);
         FsTracer.Trace("GetFileSecurityByName", fileName, $"attr=0x{fileAttributes:X}");
         return NtStatus.Success;
     }
@@ -276,7 +283,7 @@ public sealed unsafe class WinFspRamAdapter : IFileSystem
                 return V(CreateResult.Error(NtStatus.ObjectNameCollision));
             }
 
-            info.Context = dir;
+            info.Context = new FileHandleContext { Node = dir };
             info.IsDirectory = true;
             FsTracer.Trace("CreateFile-Dir", fileName, $"co=0x{createOptions:X} ga=0x{grantedAccess:X}");
             // Cache invalidation: defeat negative cache for callers that probed this name
@@ -304,9 +311,12 @@ public sealed unsafe class WinFspRamAdapter : IFileSystem
         // NTFS / memfs.cpp convention: every newly-created file gets FILE_ATTRIBUTE_ARCHIVE.
         // Returning the right attributes from CreateFile keeps the WinFsp kernel cache
         // consistent with both NTFS semantics and the Diagnostics.MemfsReference oracle.
-        file.Attributes = (FileAttributes)fileAttributes | FileAttributes.Archive;
+        // A named stream shares its base's attributes (one MFT record per file), so the
+        // request's attributes are not applied to the base through the stream.
+        if (file.BaseNode == null)
+            file.Attributes = (FileAttributes)fileAttributes | FileAttributes.Archive;
 
-        info.Context = file;
+        info.Context = new FileHandleContext { Node = file };
         info.IsDirectory = false;
         FsTracer.Trace("CreateFile", fileName, $"co=0x{createOptions:X} ga=0x{grantedAccess:X} alloc={allocationSize}");
         // Cache invalidation: see comment above for the directory branch.
@@ -325,7 +335,7 @@ public sealed unsafe class WinFspRamAdapter : IFileSystem
             return V(CreateResult.Error(NtStatus.ObjectNameNotFound));
         }
 
-        info.Context = node;
+        info.Context = new FileHandleContext { Node = node };
         info.IsDirectory = node.IsDirectory;
         FsTracer.Trace("OpenFile", fileName, $"co=0x{createOptions:X} ga=0x{grantedAccess:X} size={node.Size}");
         return V(new CreateResult(NtStatus.Success, MakeFileInfo(node)));
@@ -348,16 +358,35 @@ public sealed unsafe class WinFspRamAdapter : IFileSystem
             return V(FsResult.Error(NtStatus.DiskFull));
 
         if (replaceFileAttributes && fileAttributes != 0)
-            node.Attributes = (FileAttributes)fileAttributes;
+            node.MetadataOwner.Attributes = (FileAttributes)fileAttributes;
         else if (fileAttributes != 0)
-            node.Attributes |= (FileAttributes)fileAttributes;
+            node.MetadataOwner.Attributes |= (FileAttributes)fileAttributes;
 
-        node.LastWriteTime = DateTime.UtcNow;
+        // Common metadata is shared with the base object (stream handle → file record).
+        node.MetadataOwner.LastWriteTime = DateTime.UtcNow;
+
+        // NTFS: truncating the MAIN stream of an existing file (TRUNCATE_EXISTING on open —
+        // File.WriteAllText) removes the file's other data streams; a stream still open by
+        // another handle survives. A stream-handle overwrite (file:stream) truncates only
+        // that stream, so the cleanup applies to the main stream only.
+        IReadOnlyList<string> removedStreams = Array.Empty<string>();
+        if (node.BaseNode == null)
+        {
+            removedStreams = _fs.DeleteClosedNamedStreams(node);
+            if (removedStreams.Count > 0)
+                FsTracer.Trace("OverwriteFile-StreamsRemoved", node.Name, $"count={removedStreams.Count}");
+        }
+
         // Cache invalidation: size went to 0; subsequent reads must not see the pre-overwrite cached size.
         if (info.FileName is { } path)
         {
             FsTracer.Trace("OverwriteFile", path, $"sizeBefore={sizeBefore} alloc={allocationSize}");
             Notify(FileNotify.ChangeSize | FileNotify.ChangeLastWrite, FileNotify.ActionModified, path);
+            // Removed stream names must drop out of the kernel FileInfo cache, otherwise
+            // their stale positive entries outlive the streams (unbounded with a large
+            // FileInfoTimeout).
+            foreach (var name in removedStreams)
+                Notify(FileNotify.ChangeFileName, FileNotify.ActionRemoved, path + ":" + name);
         }
         return V(FsResult.Success(MakeFileInfo(node)));
     }
@@ -383,7 +412,8 @@ public sealed unsafe class WinFspRamAdapter : IFileSystem
 
         int toRead = (int)Math.Min(buffer.Length, fileLength - (long)offset);
         int bytesRead = node.Content.Read((long)offset, buffer.Span[..toRead]);
-        node.LastAccessTime = DateTime.UtcNow;
+        // Common metadata is shared with the base object (stream handle → file record).
+        node.MetadataOwner.LastAccessTime = DateTime.UtcNow;
         FsTracer.Trace("ReadFile", fileName, $"off={offset} buf={buffer.Length} read={bytesRead} len={fileLength}");
         return V(ReadResult.Success((uint)bytesRead));
     }
@@ -419,7 +449,8 @@ public sealed unsafe class WinFspRamAdapter : IFileSystem
             return V(WriteResult.Error(NtStatus.DiskFull));
         }
 
-        node.LastWriteTime = DateTime.UtcNow;
+        // Common metadata is shared with the base object (stream handle → file record).
+        node.MetadataOwner.LastWriteTime = DateTime.UtcNow;
 
         FsTracer.Trace("WriteFile", fileName,
             $"cio={(constrainedIo ? 1 : 0)} wteof={(writeToEndOfFile ? 1 : 0)} off={offset} wo={writeOffset} buf={buffer.Length} written={written} lenBefore={lengthBefore} lenAfter={node.Content.Length}");
@@ -465,16 +496,29 @@ public sealed unsafe class WinFspRamAdapter : IFileSystem
         if (node == null)
             return V(FsResult.Error(NtStatus.ObjectNameNotFound));
 
+        // Common metadata is shared with the base object: setting attributes/times through
+        // a stream handle changes the file record (NTFS).
+        var meta = node.MetadataOwner;
+
         // unchecked((uint)-1) means "don't change"
         if (fileAttributes != unchecked((uint)(-1)) && fileAttributes != 0)
-            node.Attributes = (FileAttributes)fileAttributes;
+            meta.Attributes = (FileAttributes)fileAttributes;
 
-        if (creationTime != 0) node.CreationTime = DateTime.FromFileTimeUtc((long)creationTime);
-        if (lastAccessTime != 0) node.LastAccessTime = DateTime.FromFileTimeUtc((long)lastAccessTime);
-        if (lastWriteTime != 0) node.LastWriteTime = DateTime.FromFileTimeUtc((long)lastWriteTime);
+        if (creationTime != 0) meta.CreationTime = DateTime.FromFileTimeUtc((long)creationTime);
+        if (lastAccessTime != 0) meta.LastAccessTime = DateTime.FromFileTimeUtc((long)lastAccessTime);
+        if (lastWriteTime != 0) meta.LastWriteTime = DateTime.FromFileTimeUtc((long)lastWriteTime);
         // changeTime: we don't track separately
 
         Notify(FileNotify.ChangeAttributes | FileNotify.ChangeLastWrite, FileNotify.ActionModified, fileName);
+        // For a stream, the changed metadata lives under the BASE name — invalidate the
+        // kernel cache for it too, or a later query of the base serves the stale entry
+        // (unbounded with a large FileInfoTimeout).
+        if (node.BaseNode is { } baseNode)
+        {
+            string? basePath = PathOf(baseNode);
+            if (basePath != null)
+                Notify(FileNotify.ChangeAttributes | FileNotify.ChangeLastWrite, FileNotify.ActionModified, basePath);
+        }
         FsTracer.Trace("SetFileAttributes", fileName, $"attr=0x{fileAttributes:X}");
         return V(FsResult.Success(MakeFileInfo(node)));
     }
@@ -503,7 +547,8 @@ public sealed unsafe class WinFspRamAdapter : IFileSystem
         if (!node.Content.SetLength((long)newSize))
             return V(FsResult.Error(NtStatus.DiskFull));
 
-        node.LastWriteTime = DateTime.UtcNow;
+        // Common metadata is shared with the base object (stream handle → file record).
+        node.MetadataOwner.LastWriteTime = DateTime.UtcNow;
         FsTracer.Trace("SetFileSize", fileName, $"newSize={newSize} sizeBefore={sizeBefore}");
         Notify(FileNotify.ChangeSize | FileNotify.ChangeLastWrite, FileNotify.ActionModified, fileName);
         return V(FsResult.Success(MakeFileInfo(node)));
@@ -519,7 +564,8 @@ public sealed unsafe class WinFspRamAdapter : IFileSystem
         if (node == null)
             return NtStatus.ObjectNameNotFound;
 
-        securityDescriptor = node.SecurityDescriptor ?? FallbackSdFor(fileName);
+        // A named stream reports its base's security descriptor (one per file on NTFS).
+        securityDescriptor = node.MetadataOwner.SecurityDescriptor ?? FallbackSdFor(fileName);
         return NtStatus.Success;
     }
 
@@ -529,10 +575,15 @@ public sealed unsafe class WinFspRamAdapter : IFileSystem
         if (node == null)
             return NtStatus.ObjectNameNotFound;
 
+        // The effective SD lives on the base object: setting security through a stream
+        // handle changes the file's single security descriptor (NTFS), so the merge is
+        // applied to — and read from — the base node.
+        var meta = node.MetadataOwner;
+
         // Effective current SD: fall back to the root SD if the node somehow has none (defensive;
         // the no-null-SD structural invariant means this should be unreachable). Threading the same
         // bytes into both the owner-change guard and the merge keeps them consistent.
-        byte[] currentSd = node.SecurityDescriptor ?? _rootSecurityDescriptorBytes;
+        byte[] currentSd = meta.SecurityDescriptor ?? _rootSecurityDescriptorBytes;
         var modification = new RawSecurityDescriptor(modificationDescriptor, 0);
 
         // NTFS oracle: a non-privileged caller cannot reassign the owner. WinFsp does not pass the
@@ -556,7 +607,7 @@ public sealed unsafe class WinFspRamAdapter : IFileSystem
 
         var result = new byte[existing.BinaryLength];
         existing.GetBinaryForm(result, 0);
-        node.SecurityDescriptor = result;
+        meta.SecurityDescriptor = result;
         FsTracer.Trace("SetFileSecurity", fileName, $"secInfo=0x{securityInformation:X}");
         return NtStatus.Success;
     }
@@ -599,9 +650,6 @@ public sealed unsafe class WinFspRamAdapter : IFileSystem
 
         if (_fs.Move(fileName, newFileName, replaceIfExists))
         {
-            // Update cached node — name changed
-            var node = Node(info);
-            if (node != null) info.Context = node; // still valid reference
             FsTracer.Trace("MoveFile", fileName, $"=> {newFileName} replace={replaceIfExists}");
             // Cache invalidation MUST happen after the lock is released (Move returned).
             // Without ActionRenamedNewName the kernel's negative cache for newFileName
@@ -688,8 +736,15 @@ public sealed unsafe class WinFspRamAdapter : IFileSystem
 
     public void Cleanup(string? fileName, FileOperationInfo info, CleanupFlags flags)
     {
-        var node = Node(info);
-        if (flags.HasFlag(CleanupFlags.Delete) && node != null)
+        var hctx = info.Context as FileHandleContext;
+        if (hctx == null)
+        {
+            if (fileName != null)
+                FsTracer.Trace("Cleanup", fileName, $"flags=0x{(uint)flags:X}");
+            return;
+        }
+        var node = hctx.Node;
+        if (flags.HasFlag(CleanupFlags.Delete))
         {
             bool wasDir = node.IsDirectory;
             bool removed = _fs.Delete(node);
@@ -703,22 +758,66 @@ public sealed unsafe class WinFspRamAdapter : IFileSystem
             FsTracer.Trace("Cleanup", fileName, $"flags=0x{(uint)flags:X}");
         }
 
-        if (node == null) return;
-
+        // Common metadata is shared with the base object (stream handle → file record).
+        var meta = node.MetadataOwner;
         if (flags.HasFlag(CleanupFlags.SetLastWriteTime))
-            node.LastWriteTime = DateTime.UtcNow;
+            meta.LastWriteTime = DateTime.UtcNow;
         if (flags.HasFlag(CleanupFlags.SetLastAccessTime))
-            node.LastAccessTime = DateTime.UtcNow;
+            meta.LastAccessTime = DateTime.UtcNow;
         if (flags.HasFlag(CleanupFlags.SetChangeTime))
-            node.LastWriteTime = DateTime.UtcNow; // reuse LastWriteTime for ChangeTime
+            meta.LastWriteTime = DateTime.UtcNow; // reuse LastWriteTime for ChangeTime
+
+        // Release THIS handle's open reference HERE, not in Close: IRP_MJ_CLEANUP is
+        // delivered with the handle close, while the Close transact is a best-effort
+        // async work item that lags arbitrarily and can be dropped — a reference
+        // released only in Close would keep long-closed streams looking open at
+        // overwrite time (DeleteClosedNamedStreams skipped them). Handles whose
+        // Cleanup the driver suppresses (unmodified, PostCleanupWhenModifiedOnly)
+        // release in Close instead — ReleaseHandleReference runs exactly once.
+        //
+        // The count is taken BEFORE the release: a concurrent unlink must never observe
+        // "no references, every Cleanup matched by a Close" while this handle's Close
+        // is still pending (see RetireNode / ReleaseUnlinkedNode).
+        //
+        // The backing pages are NOT reclaimed here (and the operation Context is NOT
+        // cleared here): the driver's Cc-cache (kernel cache) layer keeps using the
+        // section-owner's FileOperationInfo for page read/write transacts AFTER the
+        // handle's Cleanup, and memory-mapped I/O on a deleted file is legal after
+        // Cleanup (the WinFsp FSD preserves the data for it). Both are finalized in
+        // Close (below).
+        Interlocked.Increment(ref node.CleanupCount);
+        ReleaseHandleReference(hctx);
     }
 
     public void Close(FileOperationInfo info)
     {
         if (info.FileName is { } path) FsTracer.Trace("Close", path);
-        var node = Node(info);
+        var hctx = info.Context as FileHandleContext;
+        if (hctx != null)
+        {
+            var node = hctx.Node;
+            // A handle whose Cleanup the driver suppressed (unmodified) releases its
+            // reference here; an already-cleaned handle is a no-op.
+            ReleaseHandleReference(hctx);
+            Interlocked.Increment(ref node.CloseCount);
+            // Finalize: the driver posts one Close transact per file object, and a
+            // live Cc section / memory mapping pins its owning file object — so only
+            // the section owner's Close is deferred, and every Close having arrived
+            // means no handles and no sections remain: an unlinked node's pages can
+            // be reclaimed now. The operation Context is cleared with it.
+            _fs.ReleaseUnlinkedNode(node);
+        }
         info.Context = null;
-        if (node != null) _fs.CloseNode(node);
+    }
+
+    // Release this handle's open reference exactly once: on the Cleanup transact when
+    // the driver delivers one, otherwise on Close (the driver suppresses the Cleanup
+    // transact for unmodified handles, PostCleanupWhenModifiedOnly).
+    private void ReleaseHandleReference(FileHandleContext hctx)
+    {
+        if (hctx.ReferenceReleased) return;
+        hctx.ReferenceReleased = true;
+        _fs.ReleaseOpenReference(hctx.Node);
     }
 
     public int ExceptionHandler(Exception ex)
@@ -787,8 +886,30 @@ public sealed unsafe class WinFspRamAdapter : IFileSystem
     // ═══════════════════════════════════════════
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private static FileNode? Node(FileOperationInfo info)
-        => info.Context as FileNode;
+    internal static FileNode? Node(FileOperationInfo info)
+        => (info.Context as FileHandleContext)?.Node;
+
+    /// <summary>
+    /// Rebuild the internal root-relative path of <paramref name="node"/> by walking its
+    /// parent chain (the root yields <c>"\"</c>). Used to send a cache-invalidation
+    /// notification under a DIFFERENT name than the one the callback was addressed by —
+    /// e.g. the base name when a stream's shared metadata is modified through the stream.
+    /// Limitation: for an already-UNLINKED node the walk stops at <c>Parent == null</c>,
+    /// so the result is the leaf name only; a notification sent under it cannot match a
+    /// full-path kernel cache entry, so any stale entry for the unlinked name survives
+    /// until <c>FileInfoTimeoutMs</c> (the same documented known limitation as the
+    /// base-delete cascade — see the ADS design doc). The originating IRP succeeds
+    /// either way.
+    /// </summary>
+    private static string? PathOf(FileNode? node)
+    {
+        if (node == null) return null;
+        var parts = new List<string>();
+        for (var cur = node; cur != null && cur.Name.Length > 0; cur = cur.Parent)
+            parts.Add(cur.Name);
+        parts.Reverse();
+        return parts.Count == 0 ? "\\" : "\\" + string.Join("\\", parts);
+    }
 
     /// <summary>
     /// Send an FspFileSystemNotify to invalidate the WinFsp kernel FileInfo cache for
@@ -825,21 +946,31 @@ public sealed unsafe class WinFspRamAdapter : IFileSystem
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private static FspFileInfo MakeFileInfo(FileNode node)
     {
-        var metadata = node.GetReparseMetadata();
-        return new()
+        // Common metadata (attributes, reparse tag, timestamps, file id) is shared with
+        // the base object; content and size stay stream-specific (NTFS: one MFT record
+        // per file).
+        var meta = node.MetadataOwner;
+        var reparse = meta.GetReparseMetadata();
+        // A stream is data, not a container: the base of a stream may be a directory
+        // (or the volume root), but the stream handle must not carry the Directory bit
+        // — the kernel would treat the handle as a directory and reject its I/O.
+        var attributes = node.BaseNode == null
+            ? reparse.Attributes
+            : reparse.Attributes & ~FileAttributes.Directory;
+        return new FspFileInfo
         {
-            FileAttributes = (uint)metadata.Attributes,
-            ReparseTag = metadata.Tag,
+            FileAttributes = (uint)attributes,
+            ReparseTag = reparse.Tag,
             FileSize = (ulong)node.Size,
             AllocationSize = (ulong)node.AllocatedBytes, // actual pages, not logical size
-            CreationTime = ToFileTime(node.CreationTime),
-            LastAccessTime = ToFileTime(node.LastAccessTime),
-            LastWriteTime = ToFileTime(node.LastWriteTime),
-            ChangeTime = ToFileTime(node.LastWriteTime), // reuse LastWriteTime
+            CreationTime = ToFileTime(meta.CreationTime),
+            LastAccessTime = ToFileTime(meta.LastAccessTime),
+            LastWriteTime = ToFileTime(meta.LastWriteTime),
+            ChangeTime = ToFileTime(meta.LastWriteTime), // reuse LastWriteTime
             // Unique file id. Without it every file reports id 0, and a same-volume
             // std::filesystem::copy_file treats distinct files as identical (file_exists). See
             // FileNode.IndexNumber and spec file-id-uniqueness.
-            IndexNumber = node.IndexNumber,
+            IndexNumber = meta.IndexNumber,
         };
     }
 
@@ -875,4 +1006,18 @@ public sealed unsafe class WinFspRamAdapter : IFileSystem
     private static ValueTask<ReadDirectoryResult> V(ReadDirectoryResult r) => new(r);
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private static ValueTask<int> V(int r) => new(r);
+}
+
+/// <summary>
+/// Per-handle state the adapter keeps in <see cref="FileOperationInfo.Context"/>: the
+/// node plus whether THIS handle's open reference has already been released. With
+/// <c>PostCleanupWhenModifiedOnly</c> the driver suppresses the Cleanup transact for
+/// unmodified handles, so the reference is released on the FIRST of Cleanup/Close that
+/// arrives. The kernel delivers at most one Cleanup and exactly one Close per handle,
+/// so the flag makes the second call a no-op.
+/// </summary>
+internal sealed class FileHandleContext
+{
+    public FileNode Node = null!;
+    public bool ReferenceReleased;
 }

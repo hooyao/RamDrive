@@ -46,11 +46,38 @@ public sealed class FileNode : IDisposable
 
     public FileNode? Parent { get; set; }
 
+    /// <summary>
+    /// For a named-stream node (<c>base:stream</c>): the base object whose security
+    /// descriptor and common metadata (timestamps, attributes, file id) this stream
+    /// shares. Null for non-stream nodes. NTFS keeps one MFT record per file: every
+    /// stream of a file reports the file's security descriptor, creation time and
+    /// attributes, while content and size stay stream-specific.
+    /// </summary>
+    public FileNode? BaseNode { get; internal set; }
+
+    /// <summary>
+    /// The node that holds THIS object's shared security descriptor and common
+    /// metadata: the base object for a stream node, the node itself otherwise.
+    /// </summary>
+    public FileNode MetadataOwner => BaseNode ?? this;
+
     // Owned by RamFileSystem's structure lock. A namespace entry and each
     // WinFsp open context independently keep the backing object alive.
     internal bool IsLinked { get; set; } = true;
     internal int OpenReferences { get; set; }
     private int _disposed;
+
+    // Lifetime bookkeeping (see RamFileSystem.RetireNode / ReleaseUnlinkedNode): one
+    // count per Cleanup and per Close transact the adapter observed for this node. A
+    // node is FULLY CLOSED — no transact can reach it again — only when every Cleanup
+    // has been matched by its Close. The driver posts one Close per file object, and a
+    // live Cc section / memory mapping pins its owning file object, deferring that
+    // owner's Close (and preserving the data for memory-mapped I/O on a deleted file)
+    // while other handles' Closes arrive early — so a pending Close can always be
+    // pending. Unlinking (or removing on overwrite) is therefore a safe moment to free
+    // the pages only when these counts are equal.
+    internal int CleanupCount;
+    internal int CloseCount;
 
     /// <summary>
     /// Unique, stable per-node file id (NTFS-style file index / inode number). Surfaced to WinFsp

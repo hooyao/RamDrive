@@ -56,6 +56,12 @@
 - [x] 5.15 A second `:` in the leaf is rejected by the platform.
 - [x] 5.16 A bare stream inside a subdirectory is rejected (the reported bug).
 - [x] 5.17 A stream on a named subdirectory is allowed (positive control).
+- [x] 5.18 Overwriting the base removes closed named streams (NTFS
+      TRUNCATE_EXISTING semantics).
+- [x] 5.19 Overwriting the base keeps a named stream that is still open.
+- [x] 5.20 Streams share the base's security descriptor (change + query through
+      both names).
+- [x] 5.21 Streams report the base's attributes and creation time.
 
 ## 6. Verify and finalise
 
@@ -67,3 +73,55 @@
 - [ ] 6.5 Manual acceptance against a mounted volume: `dir\:ads` rejected, `\:ads`
       allowed and listable by stream enumeration, `dir:ads` allowed.
 - [ ] 6.6 `openspec validate add-alternate-data-streams`.
+
+## 7. Review follow-up — shared security descriptor and common metadata
+
+- [x] 7.1 `FileNode.BaseNode` (stream → base association, set at create) and
+      `FileNode.MetadataOwner` helper.
+- [x] 7.2 Route `GetFileSecurity(ByName)` / `SetFileSecurity` / `SetFileAttributes`
+      / `MakeFileInfo` (attributes, timestamps, IndexNumber) through the base;
+      content and size stay stream-specific.
+- [x] 7.3 I/O timestamp writes and `Cleanup` time flags update the base's times.
+- [x] 7.4 Invalidate the kernel cache for the BASE name when a stream's shared
+      metadata changes (notify under the rebuilt base path).
+- [x] 7.5 `MemfsReferenceFs` lockstep: `MetadataOf` helper + routing in `MkInfo`,
+      `GetFileSecurity(ByName)`, `GetFileSecurity`, `SetFileSecurity`,
+      `SetFileAttributes`, `Cleanup`.
+
+## 8. Review follow-up — overwrite removes closed named streams
+
+- [x] 8.1 `RamFileSystem.DeleteClosedNamedStreams`: removes the base's stream
+      nodes with no retained open context, returns their names.
+- [x] 8.2 `WinFspRamAdapter.OverwriteFile`: after truncating the MAIN stream,
+      remove the closed streams and notify the removed stream names
+      (ChangeFileName / ActionRemoved).
+- [x] 8.3 `MemfsReferenceFs.OverwriteFile` lockstep (closed = `RefCount <= 1`).
+- [x] 8.4 Handle lifetime: release the open reference in `Cleanup`, or in
+      `Close` when the driver suppressed the Cleanup (unmodified handles,
+      `PostCleanupWhenModifiedOnly`) — exactly once per handle (per-handle
+      `FileHandleContext` / `HandleContext`); finalize in `Close` — clear the
+      operation Context and reclaim an unlinked node's pages only after EVERY
+      Close has arrived (the driver posts one Close per file object; only the
+      section owner's Close is deferred by a live Cc section / memory mapping;
+      the FSD preserves data for memory-mapped I/O on a deleted file):
+      `WinFspRamAdapter` + `MemfsReferenceFs` lockstep
+      (`FileNode.CleanupCount/CloseCount`, `MemfsNode.Dead`),
+      `FileObjectLifetimeTests` updated to the new contract.
+
+## 9. Verify the review follow-up
+
+- [x] 9.1 `dotnet build` Release — no new warnings.
+- [x] 9.2 `RamDrive.Core.Tests` — all green (130/130 after the rebase onto upstream main
+      with #30 reparse support, incl. `StreamBaseAssociationTests`).
+- [x] 9.3 `RamDrive.IntegrationTests` — all green (99 tests across 16 classes, incl.
+      AlternateDataStreamsTests 29/29 and upstream's ReparseLinkTests 19/19), plain and
+      with the differential checker enabled.
+
+## 10. Follow-up (out of scope for this change)
+
+- [ ] `CleanupFlags.SetArchiveBit` lockstep gap (pre-existing): the oracle re-sets
+      `FILE_ATTRIBUTE_ARCHIVE` on the shared metadata when the driver posts the flag
+      (NTFS-faithful — the flag exists so the FSD implements "write sets archive"),
+      while `WinFspRamAdapter.Cleanup` ignores it. Unobservable in the common flow
+      (Archive is set at creation, so the `|=` is a no-op); diverges only after the
+      bit is explicitly cleared and the file is modified before close.

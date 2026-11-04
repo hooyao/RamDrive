@@ -114,7 +114,17 @@ public sealed class RamFileSystem : IDisposable
         }
     }
 
-    /// <summary>Release an open context. Unlinked data survives until the final Close.</summary>
+    /// <summary>
+    /// OpenNode pair: release an open reference and, if the node is unlinked and no
+    /// reference remains, dispose it. For adapter-driven lifetimes use
+    /// <see cref="ReleaseOpenReference"/> (Cleanup/Close of a handle) +
+    /// <see cref="ReleaseUnlinkedNode"/> (Close) instead: disposing at the first
+    /// reference release would free pages a still-mapped view can read (a live Cc
+    /// section / memory mapping pins its owning file object, so that handle's Close —
+    /// the only point at which the driver guarantees no sections remain — has not
+    /// arrived yet; the WinFsp FSD explicitly preserves data for memory-mapped I/O on a
+    /// deleted file after Cleanup).
+    /// </summary>
     public void CloseNode(FileNode node)
     {
         lock (_structureLock)
@@ -125,6 +135,52 @@ public sealed class RamFileSystem : IDisposable
                 throw new InvalidOperationException("The node has no retained open context.");
             node.OpenReferences--;
             if (!node.IsLinked && node.OpenReferences == 0)
+            {
+                _unlinkedNodes.Remove(node);
+                node.Dispose();
+            }
+        }
+    }
+
+    /// <summary>
+    /// Release one open reference WITHOUT disposing the node. The user's handle is
+    /// gone, so the node no longer counts as "open" for overwrite decisions
+    /// (DeleteClosedNamedStreams). The adapter releases the reference in Cleanup, or in
+    /// Close when the driver suppressed the Cleanup transact (unmodified handles,
+    /// PostCleanupWhenModifiedOnly) — always exactly once per handle, because the
+    /// driver's Close transact is async best-effort and lags or is dropped: a
+    /// reference released only in Close would keep closed streams looking open at
+    /// overwrite time. The backing pages are NOT reclaimed here (see
+    /// <see cref="ReleaseUnlinkedNode"/>).
+    /// </summary>
+    public void ReleaseOpenReference(FileNode node)
+    {
+        lock (_structureLock)
+        {
+            if (_disposed) return;
+            if (node.OpenReferences <= 0)
+                throw new InvalidOperationException("The node has no retained open context.");
+            node.OpenReferences--;
+        }
+    }
+
+    /// <summary>
+    /// Dispose an unlinked node whose open references have all been released AND whose
+    /// Closes have all arrived (adapter Close). The driver posts one Close transact per
+    /// file object; a live Cc section / memory mapping pins its owning file object, so
+    /// only the SECTION OWNER'S Close is deferred while the mapping is live — every
+    /// other handle's Close arrives early, with the section still alive. Every Close
+    /// having arrived (no references left, and every delivered Cleanup matched by a
+    /// delivered Close) therefore means no handles and no sections remain, and only
+    /// then are the backing pages safe to reclaim. No-op while the node is still
+    /// linked or referenced; idempotent for an already-disposed node.
+    /// </summary>
+    public void ReleaseUnlinkedNode(FileNode node)
+    {
+        lock (_structureLock)
+        {
+            if (_disposed) return;
+            if (!node.IsLinked && node.OpenReferences == 0 && node.CloseCount >= node.CleanupCount)
             {
                 _unlinkedNodes.Remove(node);
                 node.Dispose();
@@ -287,6 +343,10 @@ public sealed class RamFileSystem : IDisposable
 
             var node = FileNode.CreateFile(name, _pool);
             if (acquireReference) node.OpenReferences = 1;
+            // A stream shares its base's security descriptor and common metadata (NTFS:
+            // one MFT record per file); the adapter routes those through BaseNode.
+            if (colon >= 0)
+                node.BaseNode = colon == 0 ? _root : parent.Children![name[..colon]];
             // When the caller does not supply an SD, inherit the parent's by reference.
             // Copy-on-write contract: SetFileSecurity allocates a fresh byte[] before
             // assigning, so this share is broken on the first explicit ACL change.
@@ -353,6 +413,38 @@ public sealed class RamFileSystem : IDisposable
             return !_disposed && UnlinkNode(node);
     }
 
+    /// <summary>
+    /// Remove the named streams attached to <paramref name="baseNode"/> that have no
+    /// retained open context, and return their names. NTFS semantics: opening the MAIN
+    /// stream of an existing file for a truncate (TRUNCATE_EXISTING, e.g.
+    /// <c>File.WriteAllText</c>) removes the file's other data streams, while a stream
+    /// still open by another handle survives. Caller must not hold the structure lock.
+    /// </summary>
+    public IReadOnlyList<string> DeleteClosedNamedStreams(FileNode baseNode)
+    {
+        lock (_structureLock)
+        {
+            if (_disposed) return Array.Empty<string>();
+            bool isRoot = ReferenceEquals(baseNode, _root);
+            var parent = isRoot ? _root : baseNode.Parent;
+            if (parent == null)
+                return Array.Empty<string>();          // already unlinked
+
+            string baseName = isRoot ? string.Empty : baseNode.Name;
+            var removed = new List<string>();
+            foreach (var (sname, snode) in CollectStreams(parent, baseName))
+            {
+                if (snode.OpenReferences != 0) continue;  // still open by a handle
+                parent.Children!.Remove(sname);
+                RetireNode(snode);
+                // sname is the full key ("base:stream"); report the stream name part.
+                removed.Add(sname[(baseName.Length + 1)..]);
+            }
+            if (removed.Count > 0) parent.LastWriteTime = DateTime.UtcNow;
+            return removed;
+        }
+    }
+
     private bool UnlinkNode(FileNode node)
     {
         // Named streams are attached data, not directory entries: a directory whose only
@@ -383,13 +475,21 @@ public sealed class RamFileSystem : IDisposable
 
     /// <summary>
     /// Mark <paramref name="node"/> as unlinked and dispose it now, or retain its backing
-    /// content until the final open context closes. Caller must hold <see cref="_structureLock"/>.
+    /// content until it is safe. The node is disposed immediately only when it is fully
+    /// closed — no retained open reference AND every Cleanup has been matched by its
+    /// Close. A Close that has not arrived yet may still be on its way, possibly
+    /// deferred by the driver while a Cc section / memory mapping keeps the file node
+    /// alive (the FSD preserves the data for memory-mapped I/O on a deleted file):
+    /// disposing here would free pages a live mapping can still read. Such nodes stay
+    /// in <see cref="_unlinkedNodes"/> until their Close reclaims them
+    /// (<see cref="ReleaseUnlinkedNode"/>) or the file system shuts down.
+    /// Caller must hold <see cref="_structureLock"/>.
     /// </summary>
     private void RetireNode(FileNode node)
     {
         node.Parent = null;
         node.IsLinked = false;
-        if (node.OpenReferences == 0) node.Dispose();
+        if (node.OpenReferences == 0 && node.CloseCount >= node.CleanupCount) node.Dispose();
         else _unlinkedNodes.Add(node);
     }
 

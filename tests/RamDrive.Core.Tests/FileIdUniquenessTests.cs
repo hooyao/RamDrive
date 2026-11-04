@@ -68,8 +68,8 @@ public sealed class FileIdUniquenessTests : IDisposable
         _fs.CreateFile(@"\one.bin");
         _fs.CreateFile(@"\two.bin");
 
-        var i1 = new FileOperationInfo { Context = _fs.FindNode(@"\one.bin") };
-        var i2 = new FileOperationInfo { Context = _fs.FindNode(@"\two.bin") };
+        var i1 = new FileOperationInfo { Context = new FileHandleContext { Node = _fs.FindNode(@"\one.bin")! } };
+        var i2 = new FileOperationInfo { Context = new FileHandleContext { Node = _fs.FindNode(@"\two.bin")! } };
 
         var r1 = await _adapter.GetFileInformation(@"\one.bin", i1, default);
         var r2 = await _adapter.GetFileInformation(@"\two.bin", i2, default);
@@ -88,7 +88,7 @@ public sealed class FileIdUniquenessTests : IDisposable
         // The file id must be stable for the lifetime of the node (NTFS file ids are stable),
         // otherwise tools that stat-then-open see it "change" underneath them.
         _fs.CreateFile(@"\stable.bin");
-        var info = new FileOperationInfo { Context = _fs.FindNode(@"\stable.bin") };
+        var info = new FileOperationInfo { Context = new FileHandleContext { Node = _fs.FindNode(@"\stable.bin")! } };
 
         var a = await _adapter.GetFileInformation(@"\stable.bin", info, default);
         var b = await _adapter.GetFileInformation(@"\stable.bin", info, default);

@@ -14,6 +14,8 @@
 using System.ComponentModel;
 using System.Runtime.InteropServices;
 using System.Runtime.Versioning;
+using System.Security.AccessControl;
+using System.Security.Principal;
 using FluentAssertions;
 using Xunit;
 
@@ -471,5 +473,151 @@ public sealed class AlternateDataStreamsTests : IDisposable
         File.ReadAllText(file + ":s1").Should().Be("S1");
         File.ReadAllText(file + ":s1:$DATA").Should().Be("S1");
         File.ReadAllText(file).Should().Be("MAIN");
+    }
+
+    // ─── Overwrite removes the file's closed streams (NTFS TRUNCATE_EXISTING) ───
+
+    [Fact]
+    public void Overwriting_the_base_removes_closed_named_streams()
+    {
+        // NTFS: opening the main stream of an existing file for a truncate
+        // (TRUNCATE_EXISTING — what File.WriteAllText does) removes the file's other
+        // data streams.
+        string file = Path.Combine(_dir, "ow.txt");
+        File.WriteAllText(file, "MAIN");
+        File.WriteAllText(file + ":meta", "META");
+        File.WriteAllText(file + ":other", "OTHER");
+
+        File.WriteAllText(file, "NEW");
+
+        File.ReadAllText(file).Should().Be("NEW");
+        File.Exists(file + ":meta").Should().BeFalse();
+        File.Exists(file + ":other").Should().BeFalse();
+        EnumStreams(file).Select(s => s.Name)
+            .Should().ContainSingle().Which.Should().Be("::$DATA");
+    }
+
+    [Fact]
+    public void Overwriting_the_base_defers_open_stream_deletion_to_its_close()
+    {
+        // NTFS: a stream still open by a handle at truncate time is NOT removed at
+        // truncate time; the delete is deferred until the handle closes (delete-on-close).
+        string file = Path.Combine(_dir, "ow2.txt");
+        File.WriteAllText(file, "MAIN");
+        using var stream = new FileStream(
+            file + ":meta", FileMode.Create, FileAccess.ReadWrite,
+            FileShare.ReadWrite | FileShare.Delete);
+        stream.Write("META"u8);
+        stream.Flush();
+
+        File.WriteAllText(file, "NEW");
+
+        // While the handle is open the stream still exists and its data is readable.
+        stream.Position = 0;
+        var buffer = new byte[4];
+        stream.ReadExactly(buffer);
+        System.Text.Encoding.ASCII.GetString(buffer).Should().Be("META");
+
+        // Delete-on-close: closing the last handle removes the stream.
+        stream.Dispose();
+        File.Exists(file + ":meta").Should().BeFalse();
+    }
+
+    // ─── Shared security descriptor and common metadata ───────────────────────
+
+    [Fact]
+    public void Streams_share_the_base_security_descriptor()
+    {
+        // NTFS: one security descriptor per file, shared by all of its streams. A
+        // query through a stream name must report the base's descriptor, and a change
+        // through a stream name must land on the base.
+        string file = Path.Combine(_dir, "sec.txt");
+        File.WriteAllText(file, "DATA");
+        File.WriteAllText(file + ":meta", "META");
+
+        // 1) Change the DACL through the base; the stream name must see the same one.
+        var sd = new FileInfo(file).GetAccessControl();
+        sd.SetAccessRule(new FileSystemAccessRule(
+            new SecurityIdentifier(WellKnownSidType.BuiltinAdministratorsSid, null),
+            FileSystemRights.FullControl, AccessControlType.Allow));
+        new FileInfo(file).SetAccessControl(sd);
+
+        var viaStream = new FileInfo(file + ":meta").GetAccessControl();
+        DacRules(viaStream).Should().BeEquivalentTo(DacRules(new FileInfo(file).GetAccessControl()));
+
+        // 2) Change the DACL through the stream; the base name must see the same one.
+        var sd2 = new FileInfo(file + ":meta").GetAccessControl();
+        sd2.SetAccessRule(new FileSystemAccessRule(
+            new SecurityIdentifier(WellKnownSidType.AuthenticatedUserSid, null),
+            FileSystemRights.Read, AccessControlType.Allow));
+        new FileInfo(file + ":meta").SetAccessControl(sd2);
+
+        DacRules(new FileInfo(file).GetAccessControl()).Should()
+            .BeEquivalentTo(DacRules(new FileInfo(file + ":meta").GetAccessControl()));
+
+        // Restore a permissive DACL so the fixture teardown can delete everything.
+        var sd3 = new FileInfo(file).GetAccessControl();
+        sd3.SetAccessRule(new FileSystemAccessRule(
+            new SecurityIdentifier(WellKnownSidType.WorldSid, null),
+            FileSystemRights.FullControl, AccessControlType.Allow));
+        new FileInfo(file).SetAccessControl(sd3);
+
+        static IEnumerable<FileSystemAccessRule> DacRules(FileSystemSecurity sec)
+            => sec.GetAccessRules(true, false, typeof(SecurityIdentifier)).Cast<FileSystemAccessRule>();
+    }
+
+    [Fact]
+    public void Streams_report_the_base_attributes_and_creation_time()
+    {
+        // NTFS: all streams of a file report the file's attributes and creation time
+        // (one MFT record), while size stays stream-specific.
+        string file = Path.Combine(_dir, "attr.txt");
+        File.WriteAllText(file, "DATA");
+        File.WriteAllText(file + ":s", "X");
+
+        var baseInfo = new FileInfo(file);
+        var streamInfo = new FileInfo(file + ":s");
+
+        streamInfo.CreationTime.Should().Be(baseInfo.CreationTime);
+        streamInfo.Attributes.Should().Be(baseInfo.Attributes);
+        streamInfo.Length.Should().Be(1);
+
+        // Setting an attribute through the stream changes the FILE, and is visible
+        // through both names.
+        File.SetAttributes(file + ":s", FileAttributes.Hidden);
+        File.GetAttributes(file).Should().Be(FileAttributes.Hidden);
+        File.GetAttributes(file + ":s").Should().Be(FileAttributes.Hidden);
+    }
+
+    [Fact]
+    public void A_stream_reports_the_base_file_id()
+    {
+        // NTFS keeps one MFT record per file: a named stream reports the file's
+        // (VolumeSerialNumber, file id) pair — the discriminator std::filesystem::copy_file
+        // uses to decide whether two paths are the same file.
+        string file = Path.Combine(_dir, "fid.txt");
+        File.WriteAllText(file, "MAIN");
+        File.WriteAllText(file + ":meta", "META");
+
+        ulong idBase = QueryFileId(file);
+        ulong idStream = QueryFileId(file + ":meta");
+
+        idBase.Should().NotBe(0u, "a zero file id makes distinct files look identical");
+        idStream.Should().Be(idBase, "a named stream must report its base object's file id");
+    }
+
+    private static ulong QueryFileId(string path)
+    {
+        nint h = FileIdWin32.CreateFile(path, FileIdWin32.FILE_READ_ATTRIBUTES,
+            FileIdWin32.FILE_SHARE_READ | FileIdWin32.FILE_SHARE_WRITE | FileIdWin32.FILE_SHARE_DELETE,
+            0, FileIdWin32.OPEN_EXISTING, FileIdWin32.FILE_FLAG_BACKUP_SEMANTICS, 0);
+        if (h == -1) throw new Win32Exception(Marshal.GetLastWin32Error(), $"open {path}");
+        try
+        {
+            if (!FileIdWin32.GetFileInformationByHandle(h, out var info))
+                throw new Win32Exception(Marshal.GetLastWin32Error(), "GetFileInformationByHandle");
+            return ((ulong)info.FileIndexHigh << 32) | info.FileIndexLow;
+        }
+        finally { FileIdWin32.CloseHandle(h); }
     }
 }
