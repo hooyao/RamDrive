@@ -129,8 +129,13 @@ public sealed unsafe class MemfsReferenceFs : IFileSystem
             fileAttributes = 0;
             return GetParentStatus(fileName);
         }
-        fileAttributes = n.FileAttributes;
-        securityDescriptor = n.FileSecurity;
+        // LOCKSTEP with WinFspRamAdapter: a named stream reports its base's attributes and
+        // security descriptor (one per file on NTFS); the Directory bit never propagates.
+        var meta = MetadataOf(n);
+        fileAttributes = ReferenceEquals(meta, n)
+            ? meta.FileAttributes
+            : meta.FileAttributes & ~(uint)FileAttributes.Directory;
+        securityDescriptor = meta.FileSecurity;
         return NtStatus.Success;
     }
 
@@ -227,7 +232,8 @@ public sealed unsafe class MemfsReferenceFs : IFileSystem
     {
         var n = N(info);
         if (n == null) return NtStatus.ObjectNameNotFound;
-        securityDescriptor = n.FileSecurity;
+        // LOCKSTEP: a named stream's security descriptor is the base's single SD.
+        securityDescriptor = MetadataOf(n).FileSecurity;
         return NtStatus.Success;
     }
 
@@ -236,7 +242,9 @@ public sealed unsafe class MemfsReferenceFs : IFileSystem
         var n = N(info);
         if (n == null) return NtStatus.ObjectNameNotFound;
 
-        byte[] currentSd = n.FileSecurity ?? _defaultRootSdBytes;
+        // LOCKSTEP: setting security through a stream handle changes the base's single SD.
+        var meta = MetadataOf(n);
+        byte[] currentSd = meta.FileSecurity ?? _defaultRootSdBytes;
         var modification = new RawSecurityDescriptor(modificationDescriptor, 0);
 
         // LOCKSTEP with WinFspRamAdapter.SetFileSecurity: NTFS rejects owner reassignment by a
@@ -252,7 +260,7 @@ public sealed unsafe class MemfsReferenceFs : IFileSystem
         if ((securityInformation & 8) != 0) existing.SystemAcl = modification.SystemAcl;
         var result = new byte[existing.BinaryLength];
         existing.GetBinaryForm(result, 0);
-        n.FileSecurity = result;
+        meta.FileSecurity = result;
         return NtStatus.Success;
     }
 
@@ -288,6 +296,15 @@ public sealed unsafe class MemfsReferenceFs : IFileSystem
                 return new(CreateResult.Error(NtStatus.DiskFull));
 
             var n = NewNode(fileName);
+            // LOCKSTEP with FileNode.BaseNode: a stream node captures its base at creation
+            // so the shared-metadata routing (MetadataOf) survives the base being unlinked.
+            int colon = LeafOf(fileName).IndexOf(':');
+            if (colon >= 0)
+            {
+                int back = fileName.LastIndexOf('\\');
+                string baseKey = back < 0 ? "\\" : fileName[..(back + 1 + colon)];
+                _nodes.TryGetValue(baseKey, out n.BaseNode);
+            }
             n.FileAttributes = isDir
                 ? fileAttributes
                 : (fileAttributes | (uint)FileAttributes.Archive);
@@ -301,7 +318,7 @@ public sealed unsafe class MemfsReferenceFs : IFileSystem
             TouchParent(n);
             Interlocked.Increment(ref n.RefCount);
 
-            info.Context = n;
+            info.Context = new HandleContext { Node = n };
             info.IsDirectory = isDir;
             return new(new CreateResult(NtStatus.Success, MkInfo(n)));
         }
@@ -316,7 +333,7 @@ public sealed unsafe class MemfsReferenceFs : IFileSystem
             return new(CreateResult.Error(GetParentStatus(fileName)));
 
         Interlocked.Increment(ref n.RefCount);
-        info.Context = n;
+        info.Context = new HandleContext { Node = n };
         info.IsDirectory = (n.FileAttributes & (uint)FileAttributes.Directory) != 0;
         return new(new CreateResult(NtStatus.Success, MkInfo(n)));
     }
@@ -330,14 +347,38 @@ public sealed unsafe class MemfsReferenceFs : IFileSystem
         int s = SetFileSizeInternal(n, allocationSize, true);
         if (s != NtStatus.Success) return new(FsResult.Error(s));
 
+        // LOCKSTEP with WinFspRamAdapter.OverwriteFile: attributes and timestamps are the
+        // shared (base) metadata.
+        var meta = MetadataOf(n);
         if (replaceFileAttributes)
-            n.FileAttributes = fileAttributes | (uint)FileAttributes.Archive;
+            meta.FileAttributes = fileAttributes | (uint)FileAttributes.Archive;
         else
-            n.FileAttributes |= fileAttributes | (uint)FileAttributes.Archive;
+            meta.FileAttributes |= fileAttributes | (uint)FileAttributes.Archive;
 
         n.FileSize = 0;
         ulong now = MemfsGetSystemTime();
-        n.LastAccessTime = n.LastWriteTime = n.ChangeTime = now;
+        meta.LastAccessTime = meta.LastWriteTime = meta.ChangeTime = now;
+
+        // LOCKSTEP: NTFS removes the file's other data streams when the MAIN stream is
+        // truncated on open (TRUNCATE_EXISTING); a stream still open by a handle (RefCount
+        // > 1: one per namespace entry plus one per open context) survives.
+        if (LeafOf(n.FileName).IndexOf(':') < 0)
+        {
+            string prefix = n.FileName == "\\" ? "\\:" : n.FileName + ":";
+            lock (_mapLock)
+            {
+                var closed = new List<MemfsNode>();
+                foreach (var kv in _nodes)
+                    if (kv.Key.StartsWith(prefix, StringComparison.OrdinalIgnoreCase) && kv.Value.RefCount <= 1)
+                        closed.Add(kv.Value);
+                foreach (var stream in closed)
+                {
+                    _nodes.Remove(stream.FileName);
+                    TouchParent(stream);
+                    Dereference(stream);
+                }
+            }
+        }
         return new(FsResult.Success(MkInfo(n)));
     }
 
@@ -404,12 +445,17 @@ public sealed unsafe class MemfsReferenceFs : IFileSystem
     {
         var n = N(info);
         if (n == null) return new(FsResult.Error(NtStatus.ObjectNameNotFound));
+        // LOCKSTEP: common metadata (attributes, timestamps) is the base's for a stream.
+        var meta = MetadataOf(n);
+        // LOCKSTEP with the production FileNode.Attributes setter: a SetFileAttributes
+        // call can never set or clear the ReparsePoint bit (reparse state changes only
+        // through the reparse point operations).
         if (fileAttributes != unchecked((uint)-1))
-            n.FileAttributes = (fileAttributes & ~(uint)FileAttributes.ReparsePoint) | (n.FileAttributes & (uint)FileAttributes.ReparsePoint);
-        if (creationTime    != 0) n.CreationTime    = creationTime;
-        if (lastAccessTime  != 0) n.LastAccessTime  = lastAccessTime;
-        if (lastWriteTime   != 0) n.LastWriteTime   = lastWriteTime;
-        if (changeTime      != 0) n.ChangeTime      = changeTime;
+            meta.FileAttributes = (fileAttributes & ~(uint)FileAttributes.ReparsePoint) | (meta.FileAttributes & (uint)FileAttributes.ReparsePoint);
+        if (creationTime    != 0) meta.CreationTime    = creationTime;
+        if (lastAccessTime  != 0) meta.LastAccessTime  = lastAccessTime;
+        if (lastWriteTime   != 0) meta.LastWriteTime   = lastWriteTime;
+        if (changeTime      != 0) meta.ChangeTime      = changeTime;
         return new(FsResult.Success(MkInfo(n)));
     }
 
@@ -529,20 +575,23 @@ public sealed unsafe class MemfsReferenceFs : IFileSystem
 
     public void Cleanup(string? fileName, FileOperationInfo info, CleanupFlags flags)
     {
-        var n = N(info);
-        if (n == null) return;
+        var hctx = info.Context as HandleContext;
+        if (hctx == null) return;
+        var n = hctx.Node;
 
+        // LOCKSTEP: attributes and timestamps are the shared (base) metadata.
+        var meta = MetadataOf(n);
         if (flags.HasFlag(CleanupFlags.SetArchiveBit))
         {
-            if ((n.FileAttributes & (uint)FileAttributes.Directory) == 0)
-                n.FileAttributes |= (uint)FileAttributes.Archive;
+            if ((meta.FileAttributes & (uint)FileAttributes.Directory) == 0)
+                meta.FileAttributes |= (uint)FileAttributes.Archive;
         }
         if ((flags & (CleanupFlags.SetLastAccessTime | CleanupFlags.SetLastWriteTime | CleanupFlags.SetChangeTime)) != 0)
         {
             ulong now = MemfsGetSystemTime();
-            if (flags.HasFlag(CleanupFlags.SetLastAccessTime)) n.LastAccessTime = now;
-            if (flags.HasFlag(CleanupFlags.SetLastWriteTime))  n.LastWriteTime  = now;
-            if (flags.HasFlag(CleanupFlags.SetChangeTime))     n.ChangeTime     = now;
+            if (flags.HasFlag(CleanupFlags.SetLastAccessTime)) meta.LastAccessTime = now;
+            if (flags.HasFlag(CleanupFlags.SetLastWriteTime))  meta.LastWriteTime  = now;
+            if (flags.HasFlag(CleanupFlags.SetChangeTime))     meta.ChangeTime     = now;
         }
         if (flags.HasFlag(CleanupFlags.SetAllocationSize))
         {
@@ -564,13 +613,46 @@ public sealed unsafe class MemfsReferenceFs : IFileSystem
                 }
             }
         }
+
+        // LOCKSTEP with WinFspRamAdapter.Cleanup: count the Cleanup, then release the
+        // open reference exactly once (Close releases it for handles whose Cleanup the
+        // driver suppressed — unmodified handles). The node's data is NOT freed here
+        // (Dereference only marks it dead); Close frees it.
+        Interlocked.Increment(ref n.CleanupCount);
+        ReleaseHandleReference(hctx);
     }
 
     public void Close(FileOperationInfo info)
     {
-        var n = N(info);
-        if (n != null) Dereference(n);
+        var hctx = info.Context as HandleContext;
+        if (hctx != null)
+        {
+            var n = hctx.Node;
+            // LOCKSTEP with WinFspRamAdapter.Close: release the reference for handles
+            // whose Cleanup was suppressed, then finalize the node.
+            ReleaseHandleReference(hctx);
+            Interlocked.Increment(ref n.CloseCount);
+            // Free the data only when the node is dead AND every Close has arrived —
+            // a pending Close may be deferred by a live Cc section / memory mapping
+            // (only the section owner's Close is deferred; other handles' Closes
+            // arrive early, with the section still alive).
+            if (n.Dead && n.CloseCount >= n.CleanupCount)
+            {
+                n.FileData = null;
+                n.ReparseData = null;
+            }
+        }
         info.Context = null;
+    }
+
+    // Release this handle's open reference exactly once: on the Cleanup transact when
+    // the driver delivers one, otherwise on Close (the driver suppresses the Cleanup
+    // transact for unmodified handles, PostCleanupWhenModifiedOnly).
+    private void ReleaseHandleReference(HandleContext hctx)
+    {
+        if (hctx.ReferenceReleased) return;
+        hctx.ReferenceReleased = true;
+        Dereference(hctx.Node);
     }
 
     public ValueTask<ReadDirectoryResult> ReadDirectory(string fileName, string? pattern, string? marker,
@@ -648,7 +730,7 @@ public sealed unsafe class MemfsReferenceFs : IFileSystem
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private static MemfsNode? N(FileOperationInfo info) => info.Context as MemfsNode;
+    private static MemfsNode? N(FileOperationInfo info) => (info.Context as HandleContext)?.Node;
 
     private MemfsNode NewNode(string fileName)
     {
@@ -664,21 +746,42 @@ public sealed unsafe class MemfsReferenceFs : IFileSystem
         };
     }
 
+    // LOCKSTEP with WinFspRamAdapter.MakeFileInfo: common metadata (attributes,
+    // timestamps, file id) is shared with the base object; content and size are not.
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private static FspFileInfo MkInfo(MemfsNode n) => new()
+    private FspFileInfo MkInfo(MemfsNode n)
     {
-        FileAttributes = n.FileAttributes,
-        ReparseTag = n.ReparseTag,
-        AllocationSize = n.AllocationSize,
-        FileSize = n.FileSize,
-        CreationTime = n.CreationTime,
-        LastAccessTime = n.LastAccessTime,
-        LastWriteTime = n.LastWriteTime,
-        ChangeTime = n.ChangeTime,
-        IndexNumber = n.IndexNumber,
-        HardLinks = 0,
-        EaSize = 0,
-    };
+        var meta = MetadataOf(n);
+        // LOCKSTEP: a stream handle never carries the base's Directory bit.
+        uint attributes = ReferenceEquals(meta, n)
+            ? meta.FileAttributes
+            : meta.FileAttributes & ~(uint)FileAttributes.Directory;
+        return new()
+        {
+            FileAttributes = attributes,
+            // LOCKSTEP with production MakeFileInfo: the reparse tag is shared metadata
+            // (one MFT record per file) — a stream reports its BASE's tag.
+            ReparseTag = meta.ReparseTag,
+            AllocationSize = n.AllocationSize,
+            FileSize = n.FileSize,
+            CreationTime = meta.CreationTime,
+            LastAccessTime = meta.LastAccessTime,
+            LastWriteTime = meta.LastWriteTime,
+            ChangeTime = meta.ChangeTime,
+            IndexNumber = meta.IndexNumber,
+            HardLinks = 0,
+            EaSize = 0,
+        };
+    }
+
+    /// <summary>
+    /// The node holding the shared metadata (attributes, security descriptor, timestamps,
+    /// file id) of <paramref name="n"/>: the base object for a named-stream node
+    /// (LOCKSTEP with <c>FileNode.MetadataOwner</c> in the production adapter — NTFS keeps
+    /// one MFT record per file). The base is a persistent reference captured at creation
+    /// (<see cref="MemfsNode.BaseNode"/>), so it stays valid after the base is unlinked.
+    /// </summary>
+    private MemfsNode MetadataOf(MemfsNode n) => n.BaseNode ?? n;
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private static ulong MemfsGetSystemTime()
@@ -767,6 +870,7 @@ public sealed unsafe class MemfsReferenceFs : IFileSystem
         return res;
     }
 
+    // Instance method: MkInfo routes a stream's common metadata through its base node.
     private bool AddDirInfoStr(MemfsNode n, string name, nint buffer, uint length, uint* pBt)
     {
         var di = new FspDirInfo();
@@ -777,10 +881,12 @@ public sealed unsafe class MemfsReferenceFs : IFileSystem
 
     private void Dereference(MemfsNode n)
     {
+        // LOCKSTEP with FileNode lifetime (see MemfsNode.Dead): reaching zero only
+        // marks the node dead. Its data is freed in Close, because the WinFsp FSD
+        // defers the Close transact until every reference to the file node (handles
+        // and Cc sections / memory mappings) is gone, and it preserves data for
+        // memory-mapped I/O on a deleted file after Cleanup.
         if (Interlocked.Decrement(ref n.RefCount) == 0)
-        {
-            n.FileData = null;
-            n.ReparseData = null;
-        }
+            n.Dead = true;
     }
 }

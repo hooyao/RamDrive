@@ -63,14 +63,14 @@ public sealed class WinFspRamAdapterSetSecurityTests : IDisposable
     {
         var node = _fs.CreateDirectory(path);
         node.Should().NotBeNull();
-        return new FileOperationInfo { Context = node };
+        return new FileOperationInfo { Context = new FileHandleContext { Node = node! } };
     }
 
     [Fact]
     public void SetFileSecurity_OwnerChangeToDifferentSid_ReturnsInvalidOwner_AndLeavesSdUnchanged()
     {
         var info = NodeInfo(@"\victim");
-        var node = (FileNode)info.Context!;
+        var node = WinFspRamAdapter.Node(info)!;
         byte[] before = (byte[])node.SecurityDescriptor!.Clone();
 
         // Current owner is BA (inherited from root). This modification changes owner to WD (Everyone)
@@ -91,7 +91,7 @@ public sealed class WinFspRamAdapterSetSecurityTests : IDisposable
     public void SetFileSecurity_DaclOnlyChange_OwnerUntouched_ReturnsSuccess_AndAppliesDacl()
     {
         var info = NodeInfo(@"\daclonly");
-        var node = (FileNode)info.Context!;
+        var node = WinFspRamAdapter.Node(info)!;
         string ownerBefore = new RawSecurityDescriptor(node.SecurityDescriptor!, 0).Owner!.Value;
 
         // DACL only (owner bit NOT set): a protected DACL granting Everyone read.
@@ -108,7 +108,7 @@ public sealed class WinFspRamAdapterSetSecurityTests : IDisposable
     public void SetFileSecurity_OwnerInfoSetButSameOwner_ReturnsSuccess_AndAppliesDacl()
     {
         var info = NodeInfo(@"\sameowner");
-        var node = (FileNode)info.Context!;
+        var node = WinFspRamAdapter.Node(info)!;
         // Re-apply the SAME owner (BA) together with a DACL change. This must NOT be rejected:
         // many real callers include OWNER info carrying the unchanged owner.
         byte[] mod = Sd("O:BAD:P(A;;FR;;;WD)");
